@@ -1,15 +1,21 @@
 //! tsuiku — structural TUI diff viewer.
 //!
-//! Current scope: data contracts and git access (no TUI yet).
+//! Current scope: data contracts, git access, and the asynchronous line-diff
+//! viewer.
 
+pub mod app;
 pub mod asyncstate;
+pub mod cache;
 pub mod change;
 pub mod compose;
 pub mod coords;
 pub mod discover;
 pub mod ids;
 pub mod linediff;
+pub mod loader;
 pub mod path;
 pub mod resolve;
 pub mod structural;
 pub mod text;
+pub mod view;
+pub mod worker;

@@ -1,10 +1,10 @@
-//! Async result states and cache keys, symmetric across the line-diff layer
-//! and the structural-overlay layer.
+//! Shared states and cache keys for background diff computations.
 //!
 //! Every request and result carries its cache key; a result is applied only
 //! when `result.cache_key` equals the key currently derived from the content
-//! pair on screen. Stale results are still stored in the cache (navigating
-//! back to a neighbor reuses them) but never applied.
+//! pair on screen. Results for content that is no longer selected are still
+//! stored in the cache, so navigating back can reuse them, but are never
+//! displayed for the current selection.
 
 use std::sync::Arc;
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 blake3 = "1.8.5"
+crossterm = "0.29.0"
 gix = { version = "0.86", default-features = false, features = [
     "status",
     "index",
@@ -16,6 +17,7 @@ gix = { version = "0.86", default-features = false, features = [
 ] }
 imara-diff = "0.2.0"
 libc = "0.2.189"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.1.1"

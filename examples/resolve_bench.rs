@@ -7,6 +7,12 @@
 //! * one long-lived `git cat-file --batch` process fed every oid
 //! * `gix`, reading straight from the object database
 //!
+//! Resolver selection recorded in 2026-07 (development repository, 32 blobs /
+//! 247,788 bytes): direct gix resolution was retained. Best-of-five release
+//! measurements were 817µs for gix, 5.913ms for `--batch`, and 218.033ms for
+//! per-blob processes. Revisit only if a representative large-repository
+//! fixture shows direct gix lookup becoming a startup bottleneck.
+//!
 //! ```text
 //! cargo run --release --example resolve_bench -- <repo-dir>
 //! ```

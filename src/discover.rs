@@ -45,6 +45,12 @@ impl GixDiscoverer {
     pub fn path_resolver(&self) -> Option<&PathResolver> {
         self.paths.as_ref()
     }
+
+    /// Consume the discoverer after discovery so the already-open repository
+    /// can be reused by content resolution.
+    pub(crate) fn into_parts(self) -> (gix::Repository, Option<PathResolver>) {
+        (self.repo, self.paths)
+    }
 }
 
 /// What the status walk found out about a checked-out submodule, computed
