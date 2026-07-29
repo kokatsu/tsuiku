@@ -5,6 +5,15 @@ edition = "2024"
 
 [dependencies]
 blake3 = "1.8.5"
+gix = { version = "0.86", default-features = false, features = [
+    "status",
+    "index",
+    "dirwalk",
+    "revision",
+    "blob-diff",
+    "max-performance-safe",
+    "sha1",
+] }
 imara-diff = "0.2.0"
 libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }

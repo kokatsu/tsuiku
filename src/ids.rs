@@ -61,8 +61,21 @@ pub struct FileStamp {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ContentSource {
     Absent,
-    GitBlob { oid: Oid },
-    Worktree { path: GitPath, hint: FileStamp },
+    GitBlob {
+        oid: Oid,
+    },
+    Worktree {
+        path: GitPath,
+        hint: FileStamp,
+    },
+    /// A gitlink. There are no bytes to read; the entry *is* the commit id,
+    /// which is rendered the way git renders it in a diff body.
+    Submodule {
+        commit: Oid,
+        /// The submodule sits on `commit` but its worktree has uncommitted
+        /// changes. Git marks this by suffixing the id with `-dirty`.
+        dirty: bool,
+    },
 }
 
 /// Fully resolved content for one side.

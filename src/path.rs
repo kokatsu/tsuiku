@@ -1,7 +1,8 @@
 //! Path contracts. Git paths are arbitrary byte strings; OS paths are
 //! `PathBuf`. Targets Unix (macOS/Linux), where the conversion is lossless.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 /// A path as git reports it: an arbitrary byte string, '/'-separated.
 /// Never assume UTF-8; escape only for display.
@@ -82,6 +83,28 @@ fn push_escaping_controls(out: &mut String, s: &str) {
 /// path resolution layer, never by ad-hoc conversion.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct WorktreePath(pub PathBuf);
+
+/// Turns repository-relative git paths into filesystem paths. On Unix the
+/// conversion is lossless, because both sides are byte strings.
+#[derive(Clone, Debug)]
+pub struct PathResolver {
+    workdir: PathBuf,
+}
+
+impl PathResolver {
+    pub fn new(workdir: PathBuf) -> Self {
+        Self { workdir }
+    }
+
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    pub fn resolve(&self, path: &GitPath) -> WorktreePath {
+        use std::os::unix::ffi::OsStrExt;
+        WorktreePath(self.workdir.join(OsStr::from_bytes(path.as_bytes())))
+    }
+}
 
 #[cfg(test)]
 mod tests {
