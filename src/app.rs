@@ -442,6 +442,18 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(viewport_height);
                 true
             }
+            KeyCode::Char(']') => {
+                if let Some(target) = next_hunk_offset(self.worker.hunk_starts(), self.scroll) {
+                    self.scroll = target.min(self.max_scroll(viewport_height));
+                }
+                true
+            }
+            KeyCode::Char('[') => {
+                if let Some(target) = previous_hunk_offset(self.worker.hunk_starts(), self.scroll) {
+                    self.scroll = target.min(self.max_scroll(viewport_height));
+                }
+                true
+            }
             KeyCode::Char('n') => {
                 self.next_file();
                 true
@@ -482,7 +494,7 @@ impl App {
         );
         frame.render_widget(Paragraph::new(body), chunks[1]);
         frame.render_widget(
-            Paragraph::new(" j/k scroll  n/p file  PgUp/PgDn  q/Ctrl-C quit ")
+            Paragraph::new(" j/k scroll  [/] hunk  n/p file  PgUp/PgDn  q/Ctrl-C quit ")
                 .style(Style::default().fg(Color::DarkGray)),
             chunks[2],
         );
@@ -616,6 +628,20 @@ fn body_height(terminal_height: u16) -> usize {
 
 fn max_scroll_for_rows(rows: usize, viewport_height: usize) -> usize {
     rows.saturating_sub(viewport_height)
+}
+
+fn next_hunk_offset(hunk_starts: &[usize], scroll: usize) -> Option<usize> {
+    hunk_starts
+        .get(hunk_starts.partition_point(|&start| start <= scroll))
+        .copied()
+}
+
+fn previous_hunk_offset(hunk_starts: &[usize], scroll: usize) -> Option<usize> {
+    let before = hunk_starts.partition_point(|&start| start < scroll);
+    before
+        .checked_sub(1)
+        .and_then(|index| hunk_starts.get(index))
+        .copied()
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
@@ -885,6 +911,39 @@ mod tests {
     }
 
     #[test]
+    fn hunk_offsets_stop_at_edges_and_return_to_the_current_hunk_start() {
+        let starts = [1, 5, 12];
+        assert_eq!(next_hunk_offset(&starts, 0), Some(1));
+        assert_eq!(next_hunk_offset(&starts, 1), Some(5));
+        assert_eq!(next_hunk_offset(&starts, 12), None);
+        assert_eq!(previous_hunk_offset(&starts, 7), Some(5));
+        assert_eq!(previous_hunk_offset(&starts, 5), Some(1));
+        assert_eq!(previous_hunk_offset(&starts, 1), None);
+        assert_eq!(previous_hunk_offset(&starts, 0), None);
+    }
+
+    #[test]
+    fn hunk_past_the_last_page_clamps_to_a_viewport_that_contains_it() {
+        let starts = [10, 90, 95];
+        let rows = 100;
+        let viewport = 20;
+        let max_scroll = max_scroll_for_rows(rows, viewport);
+        assert_eq!(max_scroll, 80);
+
+        let target = next_hunk_offset(&starts, 10).expect("next hunk");
+        let scroll = target.min(max_scroll);
+        assert_eq!(target, 90);
+        assert_eq!(scroll, 80);
+        assert!((scroll..scroll + viewport).contains(&target));
+        assert!((scroll..scroll + viewport).contains(&95));
+
+        // Hunk navigation has no separate cursor: once the last page is
+        // visible, another `]` targets the same hunk and leaves the page put.
+        let repeated_target = next_hunk_offset(&starts, scroll).expect("visible next hunk");
+        assert_eq!(repeated_target.min(max_scroll), scroll);
+    }
+
+    #[test]
     fn navigation_stops_at_edges_and_skips_known_no_ops() {
         let files = vec![
             FileModel {
@@ -1003,6 +1062,46 @@ mod tests {
         assert_eq!(area, Size::new(100, 63));
         assert_eq!(body_height(area.height), 60);
         assert_eq!(app.scroll, 40);
+    }
+
+    #[test]
+    fn bracket_keys_navigate_precomputed_hunks() {
+        let mut app = test_app();
+        app.activate_content(prepared_text(
+            "a\nold one\nc\nd\nold two\nf\n",
+            "a\nnew one\nc\nd\nnew two\nf\n",
+        ));
+        wait_for_line_diff(&mut app);
+        assert_eq!(app.worker.hunk_starts(), &[1, 5]);
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), 3));
+        assert_eq!(app.scroll, 1);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), 3));
+        assert_eq!(app.scroll, 5);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), 3));
+        assert_eq!(app.scroll, 1);
+    }
+
+    #[test]
+    fn bracket_key_never_scrolls_past_the_last_page() {
+        let mut app = test_app();
+        let old = (0..60)
+            .map(|line| {
+                if line == 58 {
+                    "old\n".to_owned()
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect::<String>();
+        let new = old.replace("old\n", "new\n");
+        app.activate_content(prepared_text(&old, &new));
+        wait_for_line_diff(&mut app);
+        assert_eq!(app.worker.hunk_starts(), &[58]);
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), 5));
+        assert_eq!(app.scroll, app.max_scroll(5));
+        assert_eq!(app.scroll, 56);
     }
 
     #[test]

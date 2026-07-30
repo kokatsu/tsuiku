@@ -16,7 +16,7 @@ use crate::asyncstate::{
     AsyncState, LineDiffCacheKey, LineDiffError, LineDiffState, LineDiffUnavailable, RequestId,
 };
 use crate::cache::WeightedLru;
-use crate::linediff::{DiffRow, engine, line_tokens};
+use crate::linediff::{DiffRow, engine, hunk_starts, line_tokens};
 use crate::text::TextContent;
 
 #[derive(Clone)]
@@ -62,6 +62,13 @@ impl Slot {
 struct ResultMessage {
     key: LineDiffCacheKey,
     rows: Arc<[DiffRow]>,
+    hunk_starts: Arc<[usize]>,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    rows: Arc<[DiffRow]>,
+    hunk_starts: Arc<[usize]>,
 }
 
 /// Runs line-diff work off the terminal thread and caches completed row tables.
@@ -69,9 +76,10 @@ pub struct LineDiffCoordinator {
     slot: Arc<(Mutex<Slot>, Condvar)>,
     results: mpsc::Receiver<ResultMessage>,
     thread: Option<JoinHandle<()>>,
-    cache: WeightedLru<LineDiffCacheKey, Arc<[DiffRow]>>,
+    cache: WeightedLru<LineDiffCacheKey, CacheEntry>,
     current_key: Option<LineDiffCacheKey>,
     state: LineDiffState,
+    current_hunk_starts: Arc<[usize]>,
     next_request_id: u64,
 }
 
@@ -99,6 +107,7 @@ impl LineDiffCoordinator {
             cache: WeightedLru::new(cache_capacity),
             current_key: None,
             state: AsyncState::NotRequested,
+            current_hunk_starts: Arc::from([]),
             next_request_id: 1,
         }
     }
@@ -110,10 +119,12 @@ impl LineDiffCoordinator {
     pub fn request(&mut self, key: LineDiffCacheKey, old: Arc<TextContent>, new: Arc<TextContent>) {
         self.poll();
         self.current_key = Some(key);
-        if let Some(rows) = self.cache.get_cloned(&key) {
-            self.state = AsyncState::Ready(rows);
+        if let Some(entry) = self.cache.get_cloned(&key) {
+            self.current_hunk_starts = entry.hunk_starts;
+            self.state = AsyncState::Ready(entry.rows);
             return;
         }
+        self.current_hunk_starts = Arc::from([]);
 
         let request_id = RequestId(self.next_request_id);
         self.next_request_id += 1;
@@ -157,11 +168,19 @@ impl LineDiffCoordinator {
 
     fn accept_result(&mut self, result: ResultMessage) -> bool {
         let weight = std::mem::size_of::<LineDiffCacheKey>()
-            + std::mem::size_of::<Arc<[DiffRow]>>()
-            + std::mem::size_of_val(result.rows.as_ref());
-        self.cache
-            .insert(result.key, Arc::clone(&result.rows), weight);
+            + std::mem::size_of::<CacheEntry>()
+            + std::mem::size_of_val(result.rows.as_ref())
+            + std::mem::size_of_val(result.hunk_starts.as_ref());
+        self.cache.insert(
+            result.key,
+            CacheEntry {
+                rows: Arc::clone(&result.rows),
+                hunk_starts: Arc::clone(&result.hunk_starts),
+            },
+            weight,
+        );
         if self.current_key == Some(result.key) {
+            self.current_hunk_starts = result.hunk_starts;
             self.state = AsyncState::Ready(result.rows);
             true
         } else {
@@ -173,6 +192,7 @@ impl LineDiffCoordinator {
     pub fn skip(&mut self, reason: LineDiffUnavailable) {
         self.poll();
         self.current_key = None;
+        self.current_hunk_starts = Arc::from([]);
         if let Ok(mut slot) = self.slot.0.lock() {
             slot.queued = None;
         }
@@ -183,6 +203,7 @@ impl LineDiffCoordinator {
     pub fn reset(&mut self) {
         self.poll();
         self.current_key = None;
+        self.current_hunk_starts = Arc::from([]);
         if let Ok(mut slot) = self.slot.0.lock() {
             slot.queued = None;
         }
@@ -192,6 +213,11 @@ impl LineDiffCoordinator {
     /// Returns the state associated with the currently selected file.
     pub fn state(&self) -> &LineDiffState {
         &self.state
+    }
+
+    /// Precomputed navigation targets for the current ready row table.
+    pub fn hunk_starts(&self) -> &[usize] {
+        &self.current_hunk_starts
     }
 
     /// Returns whether a completed result is cached for `key`.
@@ -244,7 +270,15 @@ fn worker_loop(slot: Arc<(Mutex<Slot>, Condvar)>, tx: mpsc::Sender<ResultMessage
         let old = line_tokens(&job.old);
         let new = line_tokens(&job.new);
         let rows = Arc::from(engine(job.key.engine).diff(&old, &new));
-        if tx.send(ResultMessage { key: job.key, rows }).is_err() {
+        let hunk_starts = Arc::from(hunk_starts(&rows));
+        if tx
+            .send(ResultMessage {
+                key: job.key,
+                rows,
+                hunk_starts,
+            })
+            .is_err()
+        {
             return;
         }
         let (lock, _) = &*slot;
@@ -303,10 +337,13 @@ mod tests {
         let cache_key = key("a\n", "b\n");
         worker.request(cache_key, text("a\n"), text("b\n"));
         assert_eq!(wait_ready(&mut worker).len(), 2);
+        assert_eq!(worker.hunk_starts(), &[0]);
         assert!(worker.is_cached(&cache_key));
 
+        worker.reset();
         worker.request(cache_key, text("a\n"), text("b\n"));
         assert!(matches!(worker.state(), AsyncState::Ready(_)));
+        assert_eq!(worker.hunk_starts(), &[0]);
     }
 
     #[test]
@@ -321,8 +358,10 @@ mod tests {
         assert!(!worker.accept_result(ResultMessage {
             key: old_key,
             rows: Arc::from([DiffRow::Removed { old: LineIndex(0) }]),
+            hunk_starts: Arc::from([0]),
         }));
         assert!(matches!(worker.state(), AsyncState::Pending { .. }));
+        assert!(worker.hunk_starts().is_empty());
         assert!(worker.is_cached(&old_key));
     }
 
@@ -335,6 +374,7 @@ mod tests {
         assert!(!worker.accept_result(ResultMessage {
             key: stale_key,
             rows: Arc::from([DiffRow::Removed { old: LineIndex(0) }]),
+            hunk_starts: Arc::from([0]),
         }));
         assert!(matches!(
             worker.state(),

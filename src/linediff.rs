@@ -23,6 +23,22 @@ pub enum DiffRow {
     Added { new: LineIndex },
 }
 
+/// Row offsets at which a contiguous block of changed rows begins.
+///
+/// Context rows separate hunks. A removal immediately followed by additions
+/// is one replacement hunk, not two navigation targets.
+pub fn hunk_starts(rows: &[DiffRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let changed = !matches!(row, DiffRow::Context { .. });
+            let previous_was_context =
+                index == 0 || matches!(rows.get(index - 1), Some(DiffRow::Context { .. }));
+            (changed && previous_was_context).then_some(index)
+        })
+        .collect()
+}
+
 pub trait LineDiffEngine {
     fn id(&self) -> LineDiffEngineId;
     /// Diff two tokenized files. Each token is one raw line (terminator
@@ -282,5 +298,47 @@ mod tests {
     #[test]
     fn missing_trailing_newline_differs() {
         check_both_engines("a\nb", "a\nb\n");
+    }
+
+    #[test]
+    fn hunk_index_groups_adjacent_removals_and_additions() {
+        let rows = [
+            DiffRow::Context {
+                old: LineIndex(0),
+                new: LineIndex(0),
+            },
+            DiffRow::Removed { old: LineIndex(1) },
+            DiffRow::Added { new: LineIndex(1) },
+            DiffRow::Context {
+                old: LineIndex(2),
+                new: LineIndex(2),
+            },
+            DiffRow::Added { new: LineIndex(3) },
+            DiffRow::Added { new: LineIndex(4) },
+        ];
+        assert_eq!(hunk_starts(&rows), vec![1, 4]);
+    }
+
+    #[test]
+    fn hunk_index_handles_edges_and_clean_inputs() {
+        assert_eq!(
+            hunk_starts(&[
+                DiffRow::Removed { old: LineIndex(0) },
+                DiffRow::Context {
+                    old: LineIndex(1),
+                    new: LineIndex(0),
+                },
+                DiffRow::Removed { old: LineIndex(2) },
+            ]),
+            vec![0, 2]
+        );
+        assert!(hunk_starts(&[]).is_empty());
+        assert!(
+            hunk_starts(&[DiffRow::Context {
+                old: LineIndex(0),
+                new: LineIndex(0),
+            }])
+            .is_empty()
+        );
     }
 }
