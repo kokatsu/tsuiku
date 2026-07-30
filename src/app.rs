@@ -13,6 +13,7 @@
 //! ratatui objects.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::{Arc, Once};
@@ -26,10 +27,11 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Size};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::asyncstate::{
     AsyncState, LINE_MODEL_VERSION, LineDiffCacheKey, LineDiffEngineId, LineDiffUnavailable,
@@ -54,6 +56,10 @@ const CHROME_HEIGHT: u16 = 3;
 const CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LINE_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURAL_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
+// Preserve a useful diff body on an 80-column terminal, and remove the
+// sidebar entirely before it would squeeze the diff below 42 columns.
+const SIDEBAR_WIDTH: u16 = 30;
+const SIDEBAR_MIN_BODY_WIDTH: u16 = 72;
 // Metrics are diagnostic and may run for a long session. Bound sample storage
 // independently of the number of input events.
 const MAX_METRIC_SAMPLES: usize = 100_000;
@@ -368,7 +374,9 @@ impl App {
             dirty |= self.poll_workers();
             if dirty {
                 let build_started = Instant::now();
-                let body = self.body_lines(body_height(terminal_area.height));
+                let body_height = body_height(terminal_area.height);
+                let body = self.body_lines(body_height);
+                let sidebar = self.sidebar_for_body(body_height, terminal_area.width);
                 let content_kind = self.visible_content_kind();
                 record_metric(
                     self.metrics_enabled,
@@ -376,7 +384,7 @@ impl App {
                     elapsed_micros(build_started),
                 );
                 let draw_started = Instant::now();
-                terminal.draw(|frame| self.draw(frame, body))?;
+                terminal.draw(|frame| self.draw(frame, body, sidebar))?;
                 record_metric(
                     self.metrics_enabled,
                     &self.draw_micros,
@@ -475,7 +483,12 @@ impl App {
         area
     }
 
-    fn draw<'a>(&'a self, frame: &mut ratatui::Frame<'_>, body: Vec<Line<'a>>) {
+    fn draw<'a>(
+        &'a self,
+        frame: &mut ratatui::Frame<'_>,
+        body: Vec<Line<'a>>,
+        sidebar: Option<Vec<Line<'static>>>,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -492,12 +505,24 @@ impl App {
                 .block(Block::default().borders(Borders::BOTTOM)),
             chunks[0],
         );
-        frame.render_widget(Paragraph::new(body), chunks[1]);
+        let (sidebar_area, content) = body_areas(chunks[1], sidebar.is_some());
+        if let (Some(sidebar_area), Some(sidebar)) = (sidebar_area, sidebar) {
+            frame.render_widget(
+                Paragraph::new(sidebar).block(Block::default().borders(Borders::RIGHT)),
+                sidebar_area,
+            );
+        }
+        frame.render_widget(Paragraph::new(body), content);
         frame.render_widget(
             Paragraph::new(" j/k scroll  [/] hunk  n/p file  PgUp/PgDn  q/Ctrl-C quit ")
                 .style(Style::default().fg(Color::DarkGray)),
             chunks[2],
         );
+    }
+
+    fn sidebar_for_body(&self, height: usize, body_width: u16) -> Option<Vec<Line<'static>>> {
+        (self.visible_file_count() > 0 && body_width >= SIDEBAR_MIN_BODY_WIDTH)
+            .then(|| self.sidebar_lines(height, SIDEBAR_WIDTH))
     }
 
     fn body_lines(&self, height: usize) -> Vec<Line<'_>> {
@@ -538,6 +563,36 @@ impl App {
                 height,
             ),
         }
+    }
+
+    fn sidebar_lines(&self, height: usize, width: u16) -> Vec<Line<'static>> {
+        // The right border consumes one column inside the sidebar area.
+        let line_width = width.saturating_sub(1) as usize;
+        sidebar_file_indices(&self.files, self.selected, height)
+            .into_iter()
+            .map(|index| {
+                let selected = index == self.selected;
+                let prefix = if selected { "> " } else { "  " };
+                let label = file_label(&self.files[index].change);
+                let mut text = format!(
+                    "{prefix}{}",
+                    truncate_display_width(&label, line_width.saturating_sub(prefix.len()))
+                );
+                if selected {
+                    let padding = line_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+                    text.push_str(&" ".repeat(padding));
+                }
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Line::styled(text, style)
+            })
+            .collect()
     }
 
     fn visible_file_count(&self) -> usize {
@@ -624,6 +679,74 @@ fn next_visible(files: &[FileModel], selected: usize, forward: bool) -> Option<u
 
 fn body_height(terminal_height: u16) -> usize {
     terminal_height.saturating_sub(CHROME_HEIGHT) as usize
+}
+
+fn body_areas(area: Rect, show_sidebar: bool) -> (Option<Rect>, Rect) {
+    if !show_sidebar || area.width < SIDEBAR_MIN_BODY_WIDTH {
+        return (None, area);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
+        .split(area);
+    (Some(chunks[0]), chunks[1])
+}
+
+fn sidebar_file_indices(files: &[FileModel], selected: usize, height: usize) -> Vec<usize> {
+    if height == 0 || files.get(selected).is_none_or(|file| file.no_op) {
+        return Vec::new();
+    }
+
+    let mut start = selected;
+    for _ in 0..height / 2 {
+        let Some(previous) = next_visible(files, start, false) else {
+            break;
+        };
+        start = previous;
+    }
+
+    let mut indices = VecDeque::with_capacity(height);
+    let mut cursor = Some(start);
+    while let Some(index) = cursor
+        && indices.len() < height
+    {
+        indices.push_back(index);
+        cursor = next_visible(files, index, true);
+    }
+
+    while indices.len() < height {
+        let Some(previous) = next_visible(files, indices[0], false) else {
+            break;
+        };
+        indices.push_front(previous);
+    }
+    indices.into_iter().collect()
+}
+
+fn truncate_display_width(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_owned();
+    }
+
+    let content_width = max_width - 1;
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > content_width {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
 }
 
 fn max_scroll_for_rows(rows: usize, viewport_height: usize) -> usize {
@@ -798,6 +921,7 @@ mod tests {
     use crate::ids::{ContentSource, Oid};
     use crate::path::GitPath;
     use crate::text::{ClassifiedContent, classify};
+    use ratatui::backend::TestBackend;
 
     fn change(status_path: &[u8]) -> FileChange {
         FileChange::classify(
@@ -908,6 +1032,104 @@ mod tests {
         assert_eq!(body_height(24), 21);
         assert_eq!(max_scroll_for_rows(100, body_height(24)), 79);
         assert_eq!(max_scroll_for_rows(10, body_height(24)), 0);
+    }
+
+    #[test]
+    fn sidebar_disappears_before_it_squeezes_the_diff_body() {
+        let narrow = Rect::new(3, 4, SIDEBAR_MIN_BODY_WIDTH - 1, 20);
+        assert_eq!(body_areas(narrow, true), (None, narrow));
+
+        let wide = Rect::new(3, 4, SIDEBAR_MIN_BODY_WIDTH, 20);
+        let (sidebar, content) = body_areas(wide, true);
+        assert_eq!(sidebar, Some(Rect::new(3, 4, SIDEBAR_WIDTH, 20)));
+        assert_eq!(
+            content,
+            Rect::new(
+                3 + SIDEBAR_WIDTH,
+                4,
+                SIDEBAR_MIN_BODY_WIDTH - SIDEBAR_WIDTH,
+                20
+            )
+        );
+        assert_eq!(body_areas(wide, false), (None, wide));
+    }
+
+    #[test]
+    fn sidebar_window_skips_no_ops_and_keeps_the_selection_visible() {
+        let files = (0..7)
+            .map(|index| FileModel {
+                change: change(format!("{index}").as_bytes()),
+                no_op: index == 2,
+                load_error: None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sidebar_file_indices(&files, 4, 3), vec![3, 4, 5]);
+        assert_eq!(sidebar_file_indices(&files, 6, 3), vec![4, 5, 6]);
+        assert!(sidebar_file_indices(&files, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn display_width_truncation_handles_wide_characters() {
+        assert_eq!(truncate_display_width("日本語", 5), "日本…");
+        assert_eq!(UnicodeWidthStr::width("日本…"), 5);
+        assert_eq!(truncate_display_width("abc", 3), "abc");
+        assert_eq!(truncate_display_width("abc", 1), "…");
+        assert_eq!(truncate_display_width("abc", 0), "");
+    }
+
+    #[test]
+    fn sidebar_lines_mark_and_pad_the_selection() {
+        let mut app = test_app();
+        app.files[0].change.new_mode = None;
+        let lines = app.sidebar_lines(2, 10);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].spans[0].content.starts_with("> "));
+        assert_eq!(
+            UnicodeWidthStr::width(lines[0].spans[0].content.as_ref()),
+            9
+        );
+        assert_eq!(lines[0].style.bg, Some(Color::LightCyan));
+        assert!(lines[1].spans[0].content.starts_with("  "));
+    }
+
+    #[test]
+    fn wide_draw_renders_sidebar_and_narrow_draw_gives_the_body_full_width() {
+        let mut app = test_app();
+        app.files[0].change.new_mode = None;
+        let mut wide = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
+        let wide_sidebar = app.sidebar_for_body(body_height(8), 80);
+        wide.draw(|frame| app.draw(frame, vec![Line::from("diff body")], wide_sidebar))
+            .expect("wide draw");
+        let wide_buffer = wide.backend().buffer();
+        assert_eq!(
+            wide_buffer.cell((0, 2)).expect("selected marker").symbol(),
+            ">"
+        );
+        assert_eq!(
+            wide_buffer.cell((29, 2)).expect("sidebar border").symbol(),
+            "│"
+        );
+        assert_eq!(
+            wide_buffer.cell((28, 2)).expect("padded selection").bg,
+            Color::LightCyan
+        );
+        assert_eq!(wide_buffer.cell((30, 2)).expect("diff body").symbol(), "d");
+
+        let mut narrow = Terminal::new(TestBackend::new(71, 8)).expect("test terminal");
+        let narrow_sidebar = app.sidebar_for_body(body_height(8), 71);
+        narrow
+            .draw(|frame| app.draw(frame, vec![Line::from("diff body")], narrow_sidebar))
+            .expect("narrow draw");
+        let narrow_buffer = narrow.backend().buffer();
+        assert_eq!(narrow_buffer.cell((0, 2)).expect("diff body").symbol(), "d");
+        assert_ne!(
+            narrow_buffer
+                .cell((29, 2))
+                .expect("no sidebar border")
+                .symbol(),
+            "│"
+        );
     }
 
     #[test]
