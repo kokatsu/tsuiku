@@ -33,13 +33,17 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::asyncstate::{
     AsyncState, LINE_MODEL_VERSION, LineDiffCacheKey, LineDiffEngineId, LineDiffUnavailable,
+    StructuralSkip,
 };
 use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
 use crate::discover::GixDiscoverer;
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
 use crate::resolve::{GixResolver, ResolveError};
-use crate::view::build_unified_lines;
+use crate::structural::normalize::DifftStatus;
+use crate::structural::tempfiles::LanguagePathHint;
+use crate::structural_worker::StructuralDiffCoordinator;
+use crate::view::build_unified_lines_with_overlay;
 use crate::worker::LineDiffCoordinator;
 
 // The layout reserves two title rows and one footer row. Scrolling and
@@ -49,6 +53,7 @@ const CHROME_HEIGHT: u16 = 3;
 // file remains viewable; inserting it evicts older entries.
 const CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LINE_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const STRUCTURAL_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
 // Metrics are diagnostic and may run for a long session. Bound sample storage
 // independently of the number of input events.
 const MAX_METRIC_SAMPLES: usize = 100_000;
@@ -127,6 +132,7 @@ pub struct App {
     content_cache: WeightedLru<usize, Arc<PreparedContent>>,
     current_content: Option<Arc<PreparedContent>>,
     worker: LineDiffCoordinator,
+    structural_worker: StructuralDiffCoordinator,
     started_at: Instant,
     terminal_initialized_micros: Cell<Option<u64>>,
     first_content_micros: Cell<Option<u64>>,
@@ -171,6 +177,7 @@ impl App {
             content_cache: WeightedLru::new(CONTENT_CACHE_BYTES),
             current_content: None,
             worker: LineDiffCoordinator::new(LINE_DIFF_CACHE_BYTES),
+            structural_worker: StructuralDiffCoordinator::new(STRUCTURAL_DIFF_CACHE_BYTES),
             started_at,
             terminal_initialized_micros: Cell::new(None),
             first_content_micros: Cell::new(None),
@@ -190,6 +197,7 @@ impl App {
         self.scroll = 0;
         self.current_content = None;
         self.worker.reset();
+        self.structural_worker.reset();
         let Some(file) = self.files.get_mut(self.selected) else {
             return;
         };
@@ -222,6 +230,22 @@ impl App {
                     Arc::clone(content.old.as_ref().expect("text old side")),
                     Arc::clone(content.new.as_ref().expect("text new side")),
                 );
+                let change = &self.files[self.selected].change;
+                self.structural_worker.request(
+                    content.pair,
+                    change
+                        .old_path
+                        .as_ref()
+                        .map(LanguagePathHint::from_git_path)
+                        .unwrap_or_else(LanguagePathHint::none),
+                    change
+                        .new_path
+                        .as_ref()
+                        .map(LanguagePathHint::from_git_path)
+                        .unwrap_or_else(LanguagePathHint::none),
+                    Arc::clone(content.old.as_ref().expect("text old side")),
+                    Arc::clone(content.new.as_ref().expect("text new side")),
+                );
             }
         }
         self.current_content = Some(content);
@@ -244,6 +268,7 @@ impl App {
                     } else {
                         self.current_content = None;
                         self.worker.reset();
+                        self.structural_worker.reset();
                     }
                 }
             }
@@ -268,6 +293,7 @@ impl App {
         // Line-diff results perform their own cache-key check before becoming
         // visible. Content results use file_id for the equivalent check below.
         let mut dirty = self.worker.poll();
+        dirty |= self.structural_worker.poll();
         loop {
             let result = self
                 .resolver
@@ -488,10 +514,14 @@ impl App {
                 ))]
             }
             AsyncState::Failed(error) => vec![Line::from(format!("Line diff failed: {error:?}"))],
-            AsyncState::Ready(rows) => build_unified_lines(
+            AsyncState::Ready(rows) => build_unified_lines_with_overlay(
                 rows,
                 content.old.as_ref().expect("ready old text"),
                 content.new.as_ref().expect("ready new text"),
+                match self.structural_worker.state() {
+                    AsyncState::Ready(overlay) => Some(overlay.as_ref()),
+                    _ => None,
+                },
                 self.scroll,
                 height,
             ),
@@ -517,9 +547,37 @@ impl App {
             .filter(|(_, file)| !file.no_op)
             .position(|(id, _)| id == self.selected)
             .map_or(0, |index| index + 1);
+        let structural = match self.structural_worker.state() {
+            AsyncState::NotRequested => "",
+            AsyncState::Pending { .. } => "  structural: pending",
+            // Difftastic found no structural difference at all — the change
+            // is formatting noise. Say so explicitly rather than showing an
+            // empty span count, which reads as "nothing was highlighted".
+            AsyncState::Ready(overlay) if overlay.status == DifftStatus::Unchanged => {
+                "  structural: no structural change"
+            }
+            AsyncState::Ready(overlay) => {
+                return format!(
+                    " tsuiku  [{ordinal}/{visible_count}] {}  structural: {} {}/{} ",
+                    file_label(&file.change),
+                    terminal_safe_label(&overlay.language),
+                    overlay.diagnostics.accepted,
+                    overlay.diagnostics.total
+                );
+            }
+            AsyncState::Skipped(StructuralSkip::ToolUnavailable) => "  structural: unavailable",
+            AsyncState::Skipped(StructuralSkip::SizeLimited) => "  structural: size limited",
+            AsyncState::Skipped(StructuralSkip::UnsupportedLanguage) => "  structural: unsupported",
+            AsyncState::Skipped(StructuralSkip::IncompatibleVersion) => {
+                "  structural: incompatible"
+            }
+            // The A/D marker already says why; keep the title short.
+            AsyncState::Skipped(StructuralSkip::OneSided) => "  structural: n/a",
+            AsyncState::Failed(_) => "  structural: failed",
+        };
         format!(
-            " tsuiku  [{ordinal}/{visible_count}] {} ",
-            file_label(&file.change)
+            " tsuiku  [{ordinal}/{visible_count}] {}{structural} ",
+            file_label(&file.change),
         )
     }
 
@@ -586,6 +644,19 @@ fn file_label(change: &FileChange) -> String {
     } else {
         format!("{status} {path}")
     }
+}
+
+fn terminal_safe_label(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -683,6 +754,13 @@ impl Drop for App {
             "METRIC line_diff_cache_bytes={}",
             self.worker.cache_weight()
         );
+        eprintln!(
+            "METRIC structural_diff_cache_bytes={}",
+            self.structural_worker.cache_weight()
+        );
+        let (accepted, total) = self.structural_worker.diagnostic_totals();
+        eprintln!("METRIC structural_spans_accepted={accepted}");
+        eprintln!("METRIC structural_spans_total={total}");
     }
 }
 
@@ -730,6 +808,7 @@ mod tests {
             content_cache: WeightedLru::new(1024 * 1024),
             current_content: None,
             worker: LineDiffCoordinator::new(1024 * 1024),
+            structural_worker: StructuralDiffCoordinator::new(1024 * 1024),
             started_at: Instant::now(),
             terminal_initialized_micros: Cell::new(None),
             first_content_micros: Cell::new(None),
@@ -889,6 +968,14 @@ mod tests {
         assert_eq!(
             file_label(&change(b"new")),
             "A new [None → Some(Submodule)]"
+        );
+    }
+
+    #[test]
+    fn structural_language_cannot_inject_terminal_controls() {
+        assert_eq!(
+            terminal_safe_label("Ru\u{1b}[31mst\u{85}"),
+            r"Ru\u{1b}[31mst\u{85}"
         );
     }
 

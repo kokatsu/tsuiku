@@ -4,9 +4,11 @@
 //! footer. The complete diff remains a compact `DiffRow` table; only rows that
 //! fit in the viewport are converted to ratatui `Line` and `Span` values.
 
+use crate::compose::{RowKind as ComposedRowKind, compose_row};
 use crate::linediff::DiffRow;
+use crate::structural::normalize::{HighlightKind, StructuralOverlay};
 use crate::text::TextContent;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::fmt::Write;
 
@@ -79,25 +81,72 @@ pub fn build_unified_lines<'a>(
     offset: usize,
     height: usize,
 ) -> Vec<Line<'a>> {
+    build_unified_lines_with_overlay(rows, old, new, None, offset, height)
+}
+
+/// Build a viewport while applying validated structural spans. The line-diff
+/// row remains the sole source of layout; the overlay only decorates text.
+pub fn build_unified_lines_with_overlay<'a>(
+    rows: &'a [DiffRow],
+    old: &'a TextContent,
+    new: &'a TextContent,
+    overlay: Option<&'a StructuralOverlay>,
+    offset: usize,
+    height: usize,
+) -> Vec<Line<'a>> {
     let number_width = decimal_width(old.lines.len().max(new.lines.len())).max(5);
-    visible_rows(rows, old, new, offset, height)
+    rows.iter()
+        .skip(offset)
+        .take(height)
+        .copied()
         .map(|row| {
-            let (marker, style) = match row.kind {
-                RowKind::Context => (' ', Style::default()),
-                RowKind::Removed => ('-', Style::default().bg(Color::Rgb(60, 20, 25))),
-                RowKind::Added => ('+', Style::default().bg(Color::Rgb(15, 55, 35))),
+            let row = compose_row(row, old, new, overlay);
+            let (marker, line_style) = match row.kind {
+                ComposedRowKind::Context => (' ', Style::default()),
+                ComposedRowKind::Removed => ('-', Style::default().bg(Color::Rgb(60, 20, 25))),
+                ComposedRowKind::Added => ('+', Style::default().bg(Color::Rgb(15, 55, 35))),
             };
             let mut prefix = String::with_capacity(number_width * 2 + 5);
-            push_number(&mut prefix, row.old_line, number_width);
+            push_number(
+                &mut prefix,
+                row.old_line.map(|line| line.0 + 1),
+                number_width,
+            );
             prefix.push(' ');
-            push_number(&mut prefix, row.new_line, number_width);
+            push_number(
+                &mut prefix,
+                row.new_line.map(|line| line.0 + 1),
+                number_width,
+            );
             let _ = write!(prefix, " {marker} ");
-            Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(row.text, style),
-            ])
+            let mut spans = Vec::with_capacity(row.segments.len() + 1);
+            spans.push(Span::styled(prefix, line_style));
+            spans.extend(row.segments.into_iter().map(|segment| {
+                Span::styled(
+                    segment.text,
+                    structural_style(line_style, segment.highlight),
+                )
+            }));
+            Line::from(spans)
         })
         .collect()
+}
+
+fn structural_style(base: Style, highlight: Option<HighlightKind>) -> Style {
+    let Some(highlight) = highlight else {
+        return base;
+    };
+    let foreground = match highlight {
+        HighlightKind::Keyword => Color::LightMagenta,
+        HighlightKind::String => Color::LightYellow,
+        HighlightKind::Comment => Color::Gray,
+        HighlightKind::Delimiter => Color::LightCyan,
+        HighlightKind::TypeName => Color::LightBlue,
+        HighlightKind::Normal | HighlightKind::Other => Color::White,
+    };
+    base.fg(foreground)
+        .bg(Color::Rgb(85, 65, 15))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn decimal_width(value: usize) -> usize {
@@ -164,5 +213,35 @@ mod tests {
         large_new.lines.resize(1_000_000, record);
         let lines = build_unified_lines(&rows, &old, &large_new, 0, 1);
         assert_eq!(lines[0].spans[0].content, "        1000000 + ");
+    }
+
+    #[test]
+    fn structural_span_overrides_the_line_background() {
+        use crate::structural::json::parse;
+        use crate::structural::normalize::normalize;
+
+        let old = text("let old = 1;\n");
+        let new = text("let new = 1;\n");
+        let raw = parse(
+            r#"{"language":"Rust","path":"x.rs","status":"changed","chunks":[[{"rhs":{"line_number":0,"changes":[{"start":4,"end":7,"content":"new","highlight":"normal"}]}}]]}"#,
+        )
+        .unwrap();
+        let overlay = normalize(&raw, Some(&old), Some(&new));
+        let rows = [DiffRow::Added {
+            new: crate::coords::LineIndex(0),
+        }];
+
+        let lines = build_unified_lines_with_overlay(&rows, &old, &new, Some(&overlay), 0, 1);
+
+        assert_eq!(lines[0].spans.len(), 4);
+        assert_eq!(lines[0].spans[2].content, "new");
+        assert_eq!(lines[0].spans[2].style.bg, Some(Color::Rgb(85, 65, 15)));
+        assert!(
+            lines[0].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Rgb(15, 55, 35)));
     }
 }

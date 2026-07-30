@@ -50,6 +50,9 @@ pub enum StructuralSkip {
     SizeLimited,
     ToolUnavailable,
     IncompatibleVersion,
+    /// One side is absent (add or delete). Difftastic reports such a pair as
+    /// created/deleted and emits no change spans, so nothing is computed.
+    OneSided,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -58,6 +61,9 @@ pub enum StructuralError {
     /// treat a missing tool as a capability gap rather than a failure.
     ToolNotFound,
     TimedOut,
+    /// The owner asked the run to stop (shutdown). Never displayed: the
+    /// coordinator that would show it is the one being dropped.
+    Cancelled,
     ProcessFailed {
         exit_code: Option<i32>,
     },

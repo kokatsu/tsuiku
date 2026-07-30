@@ -13,12 +13,19 @@
 //! never a hang. The child is reaped only after all group kills are done
 //! (its zombie keeps the group id reserved until then, so a kill can never
 //! hit a recycled PID), and it is always waited on, so no zombie survives.
+//!
+//! Shutdown uses the same machinery: a [`CancelFlag`] shared with the owner
+//! is checked on a short interval while waiting, so a run in progress is
+//! killed and reaped instead of being abandoned to process exit. Both waits
+//! are therefore polled in `CANCEL_POLL_INTERVAL` steps rather than blocking
+//! for the whole remaining timeout.
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::asyncstate::StructuralError;
@@ -28,11 +35,35 @@ use crate::structural::json::{self, RawFileDiff};
 /// misbehaving binary.
 const VERSION_STDOUT_CAP: usize = 64 * 1024;
 
+/// How long a wait may ignore the cancel flag. Bounds how long shutdown has
+/// to wait for a running child to be killed and reaped.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How often the already-closed child is checked for its exit status.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Shared stop signal for in-flight difft runs. Cloning shares the flag.
+#[derive(Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 pub struct DifftRunner {
     pub binary: PathBuf,
     pub timeout: Duration,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    /// Set by the owner to abandon a run in progress; the child is killed
+    /// and reaped before the call returns.
+    pub cancel: CancelFlag,
 }
 
 impl Default for DifftRunner {
@@ -42,6 +73,7 @@ impl Default for DifftRunner {
             timeout: Duration::from_secs(5),
             max_stdout_bytes: 32 * 1024 * 1024,
             max_stderr_bytes: 64 * 1024,
+            cancel: CancelFlag::default(),
         }
     }
 }
@@ -123,7 +155,7 @@ impl DifftRunner {
         let mut err_data = None;
         while out_data.is_none() || err_data.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(remaining) {
+            match rx.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
                 Ok((kind, Ok(data))) => match kind {
                     PipeKind::Out => out_data = Some(data),
                     PipeKind::Err => err_data = Some(data),
@@ -132,9 +164,14 @@ impl DifftRunner {
                     kill_group(&mut child);
                     return Err(e);
                 }
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     kill_group(&mut child);
-                    return Err(StructuralError::TimedOut);
+                    return Err(StructuralError::Io);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(stop) = self.stop_reason(&mut child, deadline) {
+                        return Err(stop);
+                    }
                 }
             }
         }
@@ -145,11 +182,10 @@ impl DifftRunner {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
-                    if Instant::now() >= deadline {
-                        kill_group(&mut child);
-                        return Err(StructuralError::TimedOut);
+                    if let Some(stop) = self.stop_reason(&mut child, deadline) {
+                        return Err(stop);
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(EXIT_POLL_INTERVAL);
                 }
                 Err(_) => {
                     kill_group(&mut child);
@@ -159,6 +195,21 @@ impl DifftRunner {
         };
 
         Ok((status, stdout))
+    }
+
+    /// Kill and reap the child if the run must stop now, reporting why.
+    /// Cancellation wins over the deadline: the caller is shutting down and
+    /// a timeout would be a misleading label for a run we abandoned.
+    fn stop_reason(&self, child: &mut Child, deadline: Instant) -> Option<StructuralError> {
+        if self.cancel.is_cancelled() {
+            kill_group(child);
+            return Some(StructuralError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            kill_group(child);
+            return Some(StructuralError::TimedOut);
+        }
+        None
     }
 }
 

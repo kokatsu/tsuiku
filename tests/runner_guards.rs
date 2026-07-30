@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tsuiku::asyncstate::StructuralError;
-use tsuiku::structural::runner::DifftRunner;
+use tsuiku::structural::runner::{CancelFlag, DifftRunner};
 
 const VALID_JSON: &str = r#"{"language":"Text","path":"x","status":"unchanged"}"#;
 
@@ -28,6 +28,7 @@ fn runner(binary: PathBuf) -> DifftRunner {
         timeout: Duration::from_secs(5),
         max_stdout_bytes: 1024 * 1024,
         max_stderr_bytes: 4096,
+        cancel: CancelFlag::default(),
     }
 }
 
@@ -133,6 +134,34 @@ fn grandchild_left_after_clean_exit_times_out() {
         started.elapsed() < Duration::from_secs(5),
         "runner must not wait for the leaked process"
     );
+}
+
+#[test]
+fn cancelling_kills_and_reaps_the_running_child() {
+    // Shutdown must not simply abandon the child: the run returns promptly
+    // with `Cancelled`, and the killed script never reaches its second line.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let finished = dir.path().join("finished");
+    let bin = fake_difft(
+        &dir,
+        &format!("sleep 30\ntouch '{}'", finished.to_string_lossy()),
+    );
+    let mut r = runner(bin);
+    r.timeout = Duration::from_secs(30);
+    let cancel = r.cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    assert_eq!(run(&r), Err(StructuralError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancellation must not wait for the timeout"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!finished.exists(), "the child must have been killed");
 }
 
 #[test]
