@@ -213,6 +213,7 @@ impl App {
         file.load_error = None;
         if let Some(content) = self.content_cache.get_cloned(&self.selected) {
             self.activate_content(content);
+            self.prefetch_adjacent();
             return;
         }
         if let Some(resolver) = &self.resolver {
@@ -258,6 +259,7 @@ impl App {
     }
 
     fn handle_load_result(&mut self, result: LoadResult) {
+        let selected = result.file_id == self.selected;
         match result.result {
             Ok(content) if content.kind == PreparedKind::NoOp => {
                 // Discovery can conservatively report a candidate whose
@@ -265,7 +267,7 @@ impl App {
                 if let Some(file) = self.files.get_mut(result.file_id) {
                     file.no_op = true;
                 }
-                if result.file_id == self.selected {
+                if selected {
                     if let Some(next) = next_visible(&self.files, self.selected, true)
                         .or_else(|| next_visible(&self.files, self.selected, false))
                     {
@@ -276,6 +278,11 @@ impl App {
                         self.worker.reset();
                         self.structural_worker.reset();
                     }
+                } else {
+                    // The prefetched candidate disappeared from navigation.
+                    // Continue through no-op candidates until the selected
+                    // file has one genuinely visible neighbor warmed.
+                    self.prefetch_adjacent();
                 }
             }
             Ok(content) => {
@@ -283,15 +290,30 @@ impl App {
                 let weight = content.estimated_bytes();
                 self.content_cache
                     .insert(result.file_id, Arc::clone(&content), weight);
-                if result.file_id == self.selected {
+                if selected {
                     self.activate_content(content);
+                    self.prefetch_adjacent();
                 }
             }
             Err(error) => {
                 if let Some(file) = self.files.get_mut(result.file_id) {
                     file.load_error = Some(error);
                 }
+                if selected {
+                    self.prefetch_adjacent();
+                }
             }
+        }
+    }
+
+    fn prefetch_adjacent(&self) {
+        let Some(file_id) = adjacent_prefetch_candidate(&self.files, self.selected, |candidate| {
+            self.content_cache.contains_key(&candidate)
+        }) else {
+            return;
+        };
+        if let (Some(resolver), Some(file)) = (&self.resolver, self.files.get(file_id)) {
+            resolver.prefetch(file_id, file.change.clone());
         }
     }
 
@@ -677,6 +699,20 @@ fn next_visible(files: &[FileModel], selected: usize, forward: bool) -> Option<u
     }
 }
 
+fn adjacent_prefetch_candidate(
+    files: &[FileModel],
+    selected: usize,
+    is_cached: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    [
+        next_visible(files, selected, true),
+        next_visible(files, selected, false),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|&candidate| !is_cached(candidate))
+}
+
 fn body_height(terminal_height: u16) -> usize {
     terminal_height.saturating_sub(CHROME_HEIGHT) as usize
 }
@@ -919,6 +955,7 @@ mod tests {
     use crate::change::EntryMode;
     use crate::ids::{ContentIdentity, ContentPairId};
     use crate::ids::{ContentSource, Oid};
+    use crate::loader::LoadPriority;
     use crate::path::GitPath;
     use crate::text::{ClassifiedContent, classify};
     use ratatui::backend::TestBackend;
@@ -968,6 +1005,17 @@ mod tests {
             draw_micros: RefCell::new(Vec::new()),
             metrics_enabled: false,
         }
+    }
+
+    fn test_app_with_prefetch() -> App {
+        let mut app = test_app();
+        app.files.push(FileModel {
+            change: change(b"c"),
+            no_op: false,
+            load_error: None,
+        });
+        app.resolver = Some(ContentLoadCoordinator::new_for_test());
+        app
     }
 
     fn text_content(source: &str) -> Arc<crate::text::TextContent> {
@@ -1191,6 +1239,44 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_prefetch_prefers_forward_then_uncached_backward() {
+        let files = vec![
+            FileModel {
+                change: change(b"a"),
+                no_op: false,
+                load_error: None,
+            },
+            FileModel {
+                change: change(b"noop"),
+                no_op: true,
+                load_error: None,
+            },
+            FileModel {
+                change: change(b"c"),
+                no_op: false,
+                load_error: None,
+            },
+            FileModel {
+                change: change(b"d"),
+                no_op: false,
+                load_error: None,
+            },
+        ];
+
+        assert_eq!(adjacent_prefetch_candidate(&files, 2, |_| false), Some(3));
+        assert_eq!(
+            adjacent_prefetch_candidate(&files, 2, |candidate| candidate == 3),
+            Some(0)
+        );
+        assert_eq!(
+            adjacent_prefetch_candidate(&files, 2, |candidate| {
+                candidate == 0 || candidate == 3
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn app_navigation_methods_stop_at_edges() {
         let mut app = test_app();
         app.previous_file();
@@ -1342,6 +1428,103 @@ mod tests {
             app.current_content
                 .as_ref()
                 .is_some_and(|content| Arc::ptr_eq(content, &selected))
+        );
+    }
+
+    #[test]
+    fn prefetched_no_op_is_hidden_without_moving_the_selection() {
+        let mut app = test_app();
+        let selected = prepared(PreparedKind::Binary);
+        app.activate_content(Arc::clone(&selected));
+
+        app.handle_load_result(LoadResult {
+            file_id: 1,
+            result: Ok(prepared_value(PreparedKind::NoOp)),
+        });
+
+        assert!(app.files[1].no_op);
+        assert_eq!(app.selected, 0);
+        assert!(
+            app.current_content
+                .as_ref()
+                .is_some_and(|content| Arc::ptr_eq(content, &selected))
+        );
+    }
+
+    #[test]
+    fn selected_load_completion_queues_adjacent_prefetch() {
+        let mut app = test_app_with_prefetch();
+
+        app.handle_load_result(LoadResult {
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            Some((1, LoadPriority::Prefetch))
+        );
+    }
+
+    #[test]
+    fn completed_prefetch_does_not_chain_past_visible_content() {
+        let mut app = test_app_with_prefetch();
+        app.handle_load_result(LoadResult {
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .take_queued_for_test(),
+            Some((1, LoadPriority::Prefetch))
+        );
+
+        app.handle_load_result(LoadResult {
+            file_id: 1,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            None
+        );
+    }
+
+    #[test]
+    fn no_op_prefetch_chains_to_the_next_visible_neighbor() {
+        let mut app = test_app_with_prefetch();
+        app.handle_load_result(LoadResult {
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .take_queued_for_test(),
+            Some((1, LoadPriority::Prefetch))
+        );
+
+        app.handle_load_result(LoadResult {
+            file_id: 1,
+            result: Ok(prepared_value(PreparedKind::NoOp)),
+        });
+
+        assert!(app.files[1].no_op);
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            Some((2, LoadPriority::Prefetch))
         );
     }
 

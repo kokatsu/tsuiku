@@ -1,14 +1,16 @@
 //! Background loading and classification of file contents.
 //!
 //! Repository discovery initially produces only lightweight change metadata.
-//! This worker reads blob or worktree bytes for the selected file and classifies
-//! them as text, binary, or an unchanged candidate. It therefore avoids reading
-//! every changed file before the first screen can be shown.
+//! This worker reads blob or worktree bytes for the selected file and one
+//! adjacent prefetch candidate, classifying them as text, binary, or unchanged.
+//! It therefore avoids reading every changed file before the first screen can
+//! be shown.
 //!
 //! One job may be running and one newer job may be queued. A new selection
-//! replaces the queued job, so rapid navigation does not build an unbounded
-//! backlog. Completed results carry `file_id`, the stable index of the
-//! corresponding discovery result.
+//! replaces the queued job, while a prefetch never displaces queued selected
+//! work. Rapid navigation therefore does not build an unbounded backlog.
+//! Completed results carry `file_id`, the stable index of the corresponding
+//! discovery result.
 
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -62,28 +64,55 @@ struct LoadJob {
     change: FileChange,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoadPriority {
+    Selected,
+    Prefetch,
+}
+
+struct QueuedLoad {
+    job: LoadJob,
+    priority: LoadPriority,
+}
+
 struct Slot {
-    queued: Option<LoadJob>,
+    queued: Option<QueuedLoad>,
     running: Option<usize>,
     stopped: bool,
 }
 
 impl Slot {
-    fn enqueue(&mut self, job: LoadJob) -> bool {
-        if self.running == Some(job.file_id)
-            || self
-                .queued
-                .as_ref()
-                .is_some_and(|queued| queued.file_id == job.file_id)
-        {
+    fn enqueue(&mut self, job: LoadJob, priority: LoadPriority) -> bool {
+        if self.running == Some(job.file_id) {
             // If the user navigates A -> B -> A while A is still loading, B is
             // no longer useful and must not start after A finishes.
-            if self.running == Some(job.file_id) {
+            if priority == LoadPriority::Selected {
                 self.queued = None;
             }
             return false;
         }
-        self.queued = Some(job);
+
+        if let Some(queued) = &mut self.queued
+            && queued.job.file_id == job.file_id
+        {
+            // Selecting a queued prefetch promotes it so another prefetch
+            // cannot replace the now user-visible request.
+            if priority == LoadPriority::Selected {
+                queued.priority = LoadPriority::Selected;
+            }
+            return false;
+        }
+
+        if priority == LoadPriority::Prefetch
+            && self
+                .queued
+                .as_ref()
+                .is_some_and(|queued| queued.priority == LoadPriority::Selected)
+        {
+            return false;
+        }
+
+        self.queued = Some(QueuedLoad { job, priority });
         true
     }
 }
@@ -134,7 +163,24 @@ impl ContentLoadCoordinator {
     pub fn request(&self, file_id: usize, change: FileChange) -> bool {
         let (lock, wake) = &*self.slot;
         let mut slot = lock.lock().expect("content queue lock poisoned");
-        let queued = slot.enqueue(LoadJob { file_id, change });
+        let queued = slot.enqueue(LoadJob { file_id, change }, LoadPriority::Selected);
+        if queued {
+            wake.notify_one();
+        }
+        queued
+    }
+
+    /// Requests low-priority loading for an adjacent file.
+    ///
+    /// A prefetch may replace an older queued prefetch, but never selected
+    /// work. Returns `false` when the file is already running or queued, or
+    /// when a selected request already owns the queue. Resolution itself is
+    /// not cancellable: if a prefetch is already running, a later selected
+    /// request waits behind that one read.
+    pub fn prefetch(&self, file_id: usize, change: FileChange) -> bool {
+        let (lock, wake) = &*self.slot;
+        let mut slot = lock.lock().expect("content queue lock poisoned");
+        let queued = slot.enqueue(LoadJob { file_id, change }, LoadPriority::Prefetch);
         if queued {
             wake.notify_one();
         }
@@ -144,6 +190,40 @@ impl ContentLoadCoordinator {
     /// Returns one completed load without waiting, if available.
     pub fn try_recv(&self) -> Option<LoadResult> {
         self.results.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        let slot = Arc::new((
+            Mutex::new(Slot {
+                queued: None,
+                running: None,
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
+        let (_tx, results) = mpsc::channel();
+        Self {
+            slot,
+            results,
+            thread: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> Option<(usize, LoadPriority)> {
+        let slot = self.slot.0.lock().expect("content queue lock poisoned");
+        slot.queued
+            .as_ref()
+            .map(|queued| (queued.job.file_id, queued.priority))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_queued_for_test(&self) -> Option<(usize, LoadPriority)> {
+        let mut slot = self.slot.0.lock().expect("content queue lock poisoned");
+        slot.queued
+            .take()
+            .map(|queued| (queued.job.file_id, queued.priority))
     }
 }
 
@@ -176,7 +256,7 @@ fn worker_loop(
             if state.stopped {
                 return;
             }
-            let job = state.queued.take().expect("checked above");
+            let job = state.queued.take().expect("checked above").job;
             state.running = Some(job.file_id);
             job
         };
@@ -266,19 +346,99 @@ mod tests {
             running: None,
             stopped: false,
         };
-        assert!(slot.enqueue(job(1)));
-        assert!(slot.enqueue(job(2)));
-        assert_eq!(slot.queued.as_ref().map(|job| job.file_id), Some(2));
+        assert!(slot.enqueue(job(1), LoadPriority::Selected));
+        assert!(slot.enqueue(job(2), LoadPriority::Selected));
+        assert_eq!(
+            slot.queued.as_ref().map(|queued| queued.job.file_id),
+            Some(2)
+        );
     }
 
     #[test]
     fn returning_to_running_job_does_not_duplicate_it_and_clears_stale_queue() {
         let mut slot = Slot {
-            queued: Some(job(2)),
+            queued: Some(QueuedLoad {
+                job: job(2),
+                priority: LoadPriority::Selected,
+            }),
             running: Some(1),
             stopped: false,
         };
-        assert!(!slot.enqueue(job(1)));
+        assert!(!slot.enqueue(job(1), LoadPriority::Selected));
         assert!(slot.queued.is_none());
+    }
+
+    #[test]
+    fn selected_work_replaces_a_queued_prefetch() {
+        let mut slot = Slot {
+            queued: Some(QueuedLoad {
+                job: job(2),
+                priority: LoadPriority::Prefetch,
+            }),
+            running: Some(1),
+            stopped: false,
+        };
+
+        assert!(slot.enqueue(job(3), LoadPriority::Selected));
+        let queued = slot.queued.as_ref().expect("selected work queued");
+        assert_eq!(queued.job.file_id, 3);
+        assert_eq!(queued.priority, LoadPriority::Selected);
+    }
+
+    #[test]
+    fn latest_prefetch_replaces_the_older_prefetch() {
+        let mut slot = Slot {
+            queued: Some(QueuedLoad {
+                job: job(2),
+                priority: LoadPriority::Prefetch,
+            }),
+            running: Some(1),
+            stopped: false,
+        };
+
+        assert!(slot.enqueue(job(3), LoadPriority::Prefetch));
+        let queued = slot.queued.as_ref().expect("latest prefetch queued");
+        assert_eq!(queued.job.file_id, 3);
+        assert_eq!(queued.priority, LoadPriority::Prefetch);
+    }
+
+    #[test]
+    fn prefetch_never_displaces_queued_selected_work() {
+        let mut slot = Slot {
+            queued: Some(QueuedLoad {
+                job: job(2),
+                priority: LoadPriority::Selected,
+            }),
+            running: Some(1),
+            stopped: false,
+        };
+
+        assert!(!slot.enqueue(job(3), LoadPriority::Prefetch));
+        let queued = slot.queued.as_ref().expect("selected work retained");
+        assert_eq!(queued.job.file_id, 2);
+        assert_eq!(queued.priority, LoadPriority::Selected);
+    }
+
+    #[test]
+    fn selecting_a_queued_prefetch_promotes_it() {
+        let mut slot = Slot {
+            queued: Some(QueuedLoad {
+                job: job(2),
+                priority: LoadPriority::Prefetch,
+            }),
+            running: Some(1),
+            stopped: false,
+        };
+
+        assert!(!slot.enqueue(job(2), LoadPriority::Selected));
+        assert_eq!(
+            slot.queued.as_ref().map(|queued| queued.priority),
+            Some(LoadPriority::Selected)
+        );
+        assert!(!slot.enqueue(job(3), LoadPriority::Prefetch));
+        assert_eq!(
+            slot.queued.as_ref().map(|queued| queued.job.file_id),
+            Some(2)
+        );
     }
 }
