@@ -2,6 +2,11 @@
 name = "tsuiku"
 version = "0.1.0"
 edition = "2024"
+description = "A TUI diff viewer that overlays difftastic's structural diffs on line diffs"
+repository = "https://github.com/kokatsu/tsuiku"
+license = "MIT OR Apache-2.0"
+keywords = ["diff", "git", "tui", "difftastic"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 blake3 = "1.8.5"
