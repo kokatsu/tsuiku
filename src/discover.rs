@@ -31,6 +31,13 @@ pub struct GixDiscoverer {
     paths: Option<PathResolver>,
 }
 
+/// A revision expression resolved to the commit tree `show` should compare.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CommitRevision {
+    pub commit: Oid,
+    pub has_parent: bool,
+}
+
 impl GixDiscoverer {
     /// Open the repository containing `path`, searching parent directories the
     /// way git does, so the tool works from anywhere inside a checkout.
@@ -44,6 +51,31 @@ impl GixDiscoverer {
 
     pub fn path_resolver(&self) -> Option<&PathResolver> {
         self.paths.as_ref()
+    }
+
+    /// Resolve a git revision expression and peel tags to a commit.
+    pub fn resolve_commit_revision(
+        &self,
+        revision: &[u8],
+    ) -> Result<CommitRevision, DiscoverError> {
+        let invalid = || DiscoverError::InvalidRevision {
+            revision: GitPath::from_bytes(revision).display_escaped(),
+        };
+        let id = self
+            .repo
+            .rev_parse_single(revision.as_bstr())
+            .map_err(|_| invalid())?;
+        let commit = id
+            .object()
+            .map_err(|_| invalid())?
+            .peel_to_commit()
+            .map_err(|_| invalid())?;
+        let oid = oid_from_gix(&commit.id);
+        let has_parent = commit.parent_ids().next().is_some();
+        Ok(CommitRevision {
+            commit: oid,
+            has_parent,
+        })
     }
 
     /// Consume the discoverer after discovery so the already-open repository

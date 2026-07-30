@@ -1,4 +1,4 @@
-//! Interactive terminal viewer for worktree changes.
+//! Interactive terminal viewer for worktree and commit changes.
 //!
 //! Startup discovers changed paths and their Git metadata, but does not read
 //! every file. The selected file is loaded and classified on a background
@@ -39,8 +39,9 @@ use crate::asyncstate::{
 };
 use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
-use crate::discover::GixDiscoverer;
+use crate::discover::{CommitRevision, GixDiscoverer};
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
+use crate::path::GitPath;
 use crate::resolve::{GixResolver, ResolveError};
 use crate::structural::normalize::DifftStatus;
 use crate::structural::tempfiles::LanguagePathHint;
@@ -125,7 +126,13 @@ impl FirstContentKind {
     }
 }
 
-/// Mutable state of one interactive worktree-viewer session.
+#[derive(Clone, Copy)]
+enum RequestedView<'a> {
+    Worktree,
+    Show(&'a [u8]),
+}
+
+/// Mutable state of one interactive diff-viewer session.
 ///
 /// `App` owns the navigation state, background coordinators, and caches. It
 /// does not own terminal restoration; [`Self::run_path`] uses a separate guard
@@ -139,6 +146,7 @@ pub struct App {
     current_content: Option<Arc<PreparedContent>>,
     worker: LineDiffCoordinator,
     structural_worker: StructuralDiffCoordinator,
+    comparison_label: Option<String>,
     started_at: Instant,
     terminal_initialized_micros: Cell<Option<u64>>,
     first_content_micros: Cell<Option<u64>>,
@@ -158,14 +166,26 @@ impl App {
         }
     }
 
-    fn load(path: &Path, started_at: Instant) -> Result<Self, AppError> {
+    fn load(
+        path: &Path,
+        requested_view: RequestedView<'_>,
+        started_at: Instant,
+    ) -> Result<Self, AppError> {
         let discoverer = GixDiscoverer::open(path).map_err(AppError::Discover)?;
+        let resolved = match requested_view {
+            RequestedView::Worktree => None,
+            RequestedView::Show(revision) => Some(
+                discoverer
+                    .resolve_commit_revision(revision)
+                    .map_err(AppError::Discover)?,
+            ),
+        };
+        let (target, comparison_label) = requested_target(requested_view, resolved);
         let set = discoverer
-            .discover(&ChangeQuery::new(DiffTarget::WorktreeVsHead))
+            .discover(&ChangeQuery::new(target))
             .map_err(AppError::Discover)?;
         let (repo, paths) = discoverer.into_parts();
-        let paths = paths.ok_or(AppError::Discover(crate::change::DiscoverError::NoWorktree))?;
-        let resolver = GixResolver::new(repo, paths);
+        let resolver = GixResolver::from_repository(repo, paths);
         let files = set
             .changes
             .into_iter()
@@ -184,6 +204,7 @@ impl App {
             current_content: None,
             worker: LineDiffCoordinator::new(LINE_DIFF_CACHE_BYTES),
             structural_worker: StructuralDiffCoordinator::new(STRUCTURAL_DIFF_CACHE_BYTES),
+            comparison_label,
             started_at,
             terminal_initialized_micros: Cell::new(None),
             first_content_micros: Cell::new(None),
@@ -364,6 +385,16 @@ impl App {
     /// when `TSUIKU_METRICS` is set, measures the complete user-visible startup
     /// interval.
     pub fn run_path(path: &Path) -> Result<(), AppError> {
+        Self::run_requested(path, RequestedView::Worktree)
+    }
+
+    /// Show a commit against its first parent, or against the empty tree when
+    /// `revision` names a root commit.
+    pub fn run_show(path: &Path, revision: &[u8]) -> Result<(), AppError> {
+        Self::run_requested(path, RequestedView::Show(revision))
+    }
+
+    fn run_requested(path: &Path, requested_view: RequestedView<'_>) -> Result<(), AppError> {
         Self::require_terminal()?;
         let started_at = Instant::now();
         install_panic_hook();
@@ -374,7 +405,7 @@ impl App {
             frame.render_widget(Paragraph::new("Discovering changes…"), frame.area());
         })?;
         let terminal_initialized = elapsed_micros(started_at);
-        let mut app = Self::load(path, started_at)?;
+        let mut app = Self::load(path, requested_view, started_at)?;
         app.terminal_initialized_micros
             .set(Some(terminal_initialized));
         let result = app.event_loop(&mut terminal);
@@ -397,6 +428,7 @@ impl App {
             if dirty {
                 let build_started = Instant::now();
                 let body_height = body_height(terminal_area.height);
+                let title = self.title();
                 let body = self.body_lines(body_height);
                 let sidebar = self.sidebar_for_body(body_height, terminal_area.width);
                 let content_kind = self.visible_content_kind();
@@ -406,7 +438,7 @@ impl App {
                     elapsed_micros(build_started),
                 );
                 let draw_started = Instant::now();
-                terminal.draw(|frame| self.draw(frame, body, sidebar))?;
+                terminal.draw(|frame| self.draw(frame, title, body, sidebar))?;
                 record_metric(
                     self.metrics_enabled,
                     &self.draw_micros,
@@ -508,6 +540,7 @@ impl App {
     fn draw<'a>(
         &'a self,
         frame: &mut ratatui::Frame<'_>,
+        title: String,
         body: Vec<Line<'a>>,
         sidebar: Option<Vec<Line<'static>>>,
     ) {
@@ -520,7 +553,6 @@ impl App {
             ])
             .split(frame.area());
 
-        let title = self.title();
         frame.render_widget(
             Paragraph::new(title)
                 .style(Style::default().add_modifier(Modifier::BOLD))
@@ -549,10 +581,10 @@ impl App {
 
     fn body_lines(&self, height: usize) -> Vec<Line<'_>> {
         if self.visible_file_count() == 0 {
-            return vec![Line::from("Working tree is clean.")];
+            return vec![Line::from(self.no_changes_message())];
         }
         let Some(file) = self.files.get(self.selected) else {
-            return vec![Line::from("Working tree is clean.")];
+            return vec![Line::from(self.no_changes_message())];
         };
         if let Some(error) = &file.load_error {
             return vec![Line::from(format!("Cannot read file: {error}"))];
@@ -621,13 +653,25 @@ impl App {
         self.files.iter().filter(|file| !file.no_op).count()
     }
 
+    fn no_changes_message(&self) -> &'static str {
+        if self.comparison_label.is_some() {
+            "No changes in this comparison."
+        } else {
+            "Working tree is clean."
+        }
+    }
+
     fn title(&self) -> String {
+        let prefix = match &self.comparison_label {
+            Some(label) => format!(" tsuiku  {label}  "),
+            None => " tsuiku  ".to_owned(),
+        };
         let visible_count = self.visible_file_count();
         if visible_count == 0 {
-            return " tsuiku  no changes ".to_owned();
+            return format!("{prefix}no changes ");
         }
         let Some(file) = self.files.get(self.selected) else {
-            return " tsuiku  no changes ".to_owned();
+            return format!("{prefix}no changes ");
         };
         let ordinal = self
             .files
@@ -647,7 +691,7 @@ impl App {
             }
             AsyncState::Ready(overlay) => {
                 return format!(
-                    " tsuiku  [{ordinal}/{visible_count}] {}  structural: {} {}/{} ",
+                    "{prefix}[{ordinal}/{visible_count}] {}  structural: {} {}/{} ",
                     file_label(&file.change),
                     terminal_safe_label(&overlay.language),
                     overlay.diagnostics.accepted,
@@ -665,7 +709,7 @@ impl App {
             AsyncState::Failed(_) => "  structural: failed",
         };
         format!(
-            " tsuiku  [{ordinal}/{visible_count}] {}{structural} ",
+            "{prefix}[{ordinal}/{visible_count}] {}{structural} ",
             file_label(&file.change),
         )
     }
@@ -688,6 +732,31 @@ impl App {
             AsyncState::Failed(_) => Some(FirstContentKind::LineDiffError),
             AsyncState::NotRequested | AsyncState::Pending { .. } => None,
         }
+    }
+}
+
+fn requested_target(
+    requested_view: RequestedView<'_>,
+    resolved: Option<CommitRevision>,
+) -> (DiffTarget, Option<String>) {
+    match (requested_view, resolved) {
+        (RequestedView::Worktree, None) => (DiffTarget::WorktreeVsHead, None),
+        (RequestedView::Show(revision), Some(resolved)) => (
+            DiffTarget::CommitVsParent {
+                commit: resolved.commit,
+            },
+            Some(commit_comparison_label(revision, resolved.has_parent)),
+        ),
+        _ => unreachable!("only show revisions have resolved commit metadata"),
+    }
+}
+
+fn commit_comparison_label(revision: &[u8], has_parent: bool) -> String {
+    let revision = GitPath::from_bytes(revision).display_escaped();
+    if has_parent {
+        format!("comparing {revision}^1..{revision}")
+    } else {
+        format!("comparing empty..{revision}")
     }
 }
 
@@ -996,6 +1065,7 @@ mod tests {
             current_content: None,
             worker: LineDiffCoordinator::new(1024 * 1024),
             structural_worker: StructuralDiffCoordinator::new(1024 * 1024),
+            comparison_label: None,
             started_at: Instant::now(),
             terminal_initialized_micros: Cell::new(None),
             first_content_micros: Cell::new(None),
@@ -1147,8 +1217,15 @@ mod tests {
         app.files[0].change.new_mode = None;
         let mut wide = Terminal::new(TestBackend::new(80, 8)).expect("test terminal");
         let wide_sidebar = app.sidebar_for_body(body_height(8), 80);
-        wide.draw(|frame| app.draw(frame, vec![Line::from("diff body")], wide_sidebar))
-            .expect("wide draw");
+        wide.draw(|frame| {
+            app.draw(
+                frame,
+                app.title(),
+                vec![Line::from("diff body")],
+                wide_sidebar,
+            )
+        })
+        .expect("wide draw");
         let wide_buffer = wide.backend().buffer();
         assert_eq!(
             wide_buffer.cell((0, 2)).expect("selected marker").symbol(),
@@ -1167,7 +1244,14 @@ mod tests {
         let mut narrow = Terminal::new(TestBackend::new(71, 8)).expect("test terminal");
         let narrow_sidebar = app.sidebar_for_body(body_height(8), 71);
         narrow
-            .draw(|frame| app.draw(frame, vec![Line::from("diff body")], narrow_sidebar))
+            .draw(|frame| {
+                app.draw(
+                    frame,
+                    app.title(),
+                    vec![Line::from("diff body")],
+                    narrow_sidebar,
+                )
+            })
             .expect("narrow draw");
         let narrow_buffer = narrow.backend().buffer();
         assert_eq!(narrow_buffer.cell((0, 2)).expect("diff body").symbol(), "d");
@@ -1335,6 +1419,78 @@ mod tests {
         assert_eq!(
             file_label(&change(b"new")),
             "A new [None → Some(Submodule)]"
+        );
+    }
+
+    #[test]
+    fn requested_view_selects_the_target_and_comparison_label_together() {
+        assert_eq!(
+            requested_target(RequestedView::Worktree, None),
+            (DiffTarget::WorktreeVsHead, None)
+        );
+
+        let commit = Oid([7; 20]);
+        assert_eq!(
+            requested_target(
+                RequestedView::Show(b"HEAD"),
+                Some(CommitRevision {
+                    commit,
+                    has_parent: true,
+                }),
+            ),
+            (
+                DiffTarget::CommitVsParent { commit },
+                Some("comparing HEAD^1..HEAD".to_owned()),
+            )
+        );
+        assert_eq!(
+            requested_target(
+                RequestedView::Show(b"fixture-root"),
+                Some(CommitRevision {
+                    commit,
+                    has_parent: false,
+                }),
+            ),
+            (
+                DiffTarget::CommitVsParent { commit },
+                Some("comparing empty..fixture-root".to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn commit_comparison_describes_first_parent_and_root_ranges() {
+        assert_eq!(
+            commit_comparison_label(b"feature", true),
+            "comparing feature^1..feature"
+        );
+        assert_eq!(
+            commit_comparison_label(b"fixture-root", false),
+            "comparing empty..fixture-root"
+        );
+    }
+
+    #[test]
+    fn commit_comparison_escapes_terminal_controls_and_invalid_bytes() {
+        assert_eq!(
+            commit_comparison_label(b"bad\x1b\xff", true),
+            r"comparing bad\x1b\xff^1..bad\x1b\xff"
+        );
+    }
+
+    #[test]
+    fn title_includes_the_commit_comparison() {
+        let mut app = test_app();
+        app.comparison_label = Some("comparing HEAD^1..HEAD".to_owned());
+        assert_eq!(
+            app.title(),
+            " tsuiku  comparing HEAD^1..HEAD  [1/2] A a [None → Some(Submodule)] "
+        );
+        app.files.iter_mut().for_each(|file| file.no_op = true);
+        assert_eq!(app.title(), " tsuiku  comparing HEAD^1..HEAD  no changes ");
+        assert_eq!(
+            app.body_lines(10)[0].spans[0].content,
+            "No changes in this comparison."
         );
     }
 

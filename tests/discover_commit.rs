@@ -5,7 +5,7 @@ mod common;
 
 use common::{rev_parse, shared};
 use tsuiku::change::{
-    ChangeDiscoverer, ChangeQuery, ChangeSet, ChangeStatus, DiffTarget, EntryMode,
+    ChangeDiscoverer, ChangeQuery, ChangeSet, ChangeStatus, DiffTarget, DiscoverError, EntryMode,
 };
 use tsuiku::discover::GixDiscoverer;
 use tsuiku::ids::{ContentSource, ResolvedContent};
@@ -15,6 +15,7 @@ use tsuiku::resolve::{GixResolver, resolve_changes};
 // The fixture tags the commits these tests name, so adding history to the
 // builder does not silently retarget them.
 const ROOT: &str = "fixture-root";
+const ANNOTATED_ROOT: &str = "fixture-annotated-root";
 const MERGE: &str = "fixture-merge";
 const GITLINK: &str = "fixture-gitlink";
 const RENAME: &str = "fixture-rename";
@@ -33,6 +34,63 @@ fn paths(set: &ChangeSet) -> Vec<String> {
         .iter()
         .map(|c| c.display_path().display_escaped())
         .collect()
+}
+
+#[test]
+fn revision_expressions_resolve_and_peel_to_commits() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+
+    let root = discoverer
+        .resolve_commit_revision(ROOT.as_bytes())
+        .expect("resolve root tag");
+    assert_eq!(root.commit, rev_parse(&repo, ROOT));
+    assert!(!root.has_parent);
+
+    let annotated = discoverer
+        .resolve_commit_revision(ANNOTATED_ROOT.as_bytes())
+        .expect("peel annotated tag");
+    assert_eq!(
+        annotated.commit,
+        rev_parse(&repo, &format!("{ANNOTATED_ROOT}^{{commit}}"))
+    );
+    assert!(!annotated.has_parent);
+
+    let parent = discoverer
+        .resolve_commit_revision(b"fixture-merge^1")
+        .expect("resolve revision expression");
+    assert_eq!(parent.commit, rev_parse(&repo, "fixture-merge^1"));
+    assert!(parent.has_parent);
+}
+
+#[test]
+fn an_invalid_revision_is_reported_without_terminal_controls() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    let err = discoverer
+        .resolve_commit_revision(b"missing\x1b[31m")
+        .expect_err("missing revision fails");
+    assert!(
+        matches!(
+            err,
+            DiscoverError::InvalidRevision { ref revision }
+                if revision == r"missing\x1b[31m"
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn head_is_invalid_in_an_unborn_repository() {
+    let repo = shared().repo("unborn");
+    let discoverer = GixDiscoverer::open(&repo).expect("open unborn repository");
+    let err = discoverer
+        .resolve_commit_revision(b"HEAD")
+        .expect_err("unborn HEAD has no commit");
+    assert!(
+        matches!(err, DiscoverError::InvalidRevision { ref revision } if revision == "HEAD"),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -153,6 +211,17 @@ fn a_bare_repository_can_diff_commits() {
         .discover(&ChangeQuery::new(DiffTarget::CommitVsParent { commit }))
         .expect("discover");
     assert_eq!(paths(&set), vec!["committed_rename_dst.txt".to_string()]);
+}
+
+#[test]
+fn a_bare_repository_can_resolve_a_symbolic_revision() {
+    let repo = shared().repo("bare");
+    let discoverer = GixDiscoverer::open(&repo).expect("open a bare repository");
+    let resolved = discoverer
+        .resolve_commit_revision(RENAME.as_bytes())
+        .expect("resolve tag");
+    assert_eq!(resolved.commit, rev_parse(&repo, RENAME));
+    assert!(resolved.has_parent);
 }
 
 #[test]

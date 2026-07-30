@@ -15,8 +15,9 @@
 #   sparse/   — a cone sparse checkout with an updated skip-worktree entry
 #   symlinks-off/ — core.symlinks is off, so links are plain files on disk
 #
-# main/ carries tags (fixture-root, fixture-merge, fixture-gitlink,
-# fixture-rename) so tests name commits instead of counting back from HEAD.
+# main/ carries tags (fixture-root, fixture-annotated-root, fixture-merge,
+# fixture-gitlink, fixture-rename) so tests name commits instead of counting
+# back from HEAD.
 #
 # The global git config is neutralised so the fixtures do not inherit the
 # developer's settings (autocrlf, diff.external, and friends).
@@ -103,6 +104,7 @@ git add -A
 git commit --quiet -m 'root commit'
 root_commit=$(git rev-parse HEAD)
 git tag fixture-root
+git tag --annotate --message 'annotated root tag' fixture-annotated-root
 
 # --- a merge commit, for CommitVsParent first-parent handling -------------
 git checkout --quiet -b side

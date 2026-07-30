@@ -138,6 +138,8 @@ pub enum DiscoverError {
     NoWorktree,
     /// The revision named by `CommitVsParent` does not exist.
     NoSuchCommit { commit: Oid },
+    /// A revision expression did not resolve to a commit.
+    InvalidRevision { revision: String },
     /// Reading refs, the index, or the object database failed.
     Repository(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -148,6 +150,9 @@ impl std::fmt::Display for DiscoverError {
             Self::OpenRepository(e) => write!(f, "cannot open repository: {e}"),
             Self::NoWorktree => write!(f, "repository has no worktree"),
             Self::NoSuchCommit { commit } => write!(f, "no such commit: {}", commit.to_hex()),
+            Self::InvalidRevision { revision } => {
+                write!(f, "revision does not name a commit: {revision}")
+            }
             Self::Repository(e) => write!(f, "repository read failed: {e}"),
         }
     }

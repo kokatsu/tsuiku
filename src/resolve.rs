@@ -49,6 +49,14 @@ impl GixResolver {
         Self { repo, paths }
     }
 
+    /// Reuse an already-open repository. Bare repositories have no worktree,
+    /// but commit diffs only resolve object-database content, so the git
+    /// directory is a harmless path fallback.
+    pub(crate) fn from_repository(repo: gix::Repository, paths: Option<PathResolver>) -> Self {
+        let paths = paths.unwrap_or_else(|| PathResolver::new(repo.git_dir().to_path_buf()));
+        Self { repo, paths }
+    }
+
     /// Locate the repository containing `path`, searching parent directories
     /// the way [`crate::discover::GixDiscoverer::open`] does.
     pub fn open(path: &Path) -> Result<Self, ResolveError> {
