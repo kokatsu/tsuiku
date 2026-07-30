@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+      - run: nix develop -c cargo fmt --check
+      - run: nix develop -c cargo clippy --all-targets -- -D warnings
+      - run: nix develop -c cargo test
+
+  # Records METRIC lines for trend watching; hosted runners are too noisy
+  # for hard thresholds, so this job never gates a merge.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-cargo-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+      - name: Run benches
+        # An explicit `shell: bash` turns on pipefail, so a failed bench
+        # is not masked by the trailing tee.
+        shell: bash
+        run: |
+          {
+            echo '## Bench metrics'
+            echo '```'
+            nix develop -c cargo run --release --example engine_bench
+            nix develop -c cargo run --release --example view_bench
+            nix develop -c cargo run --release --example difft_bench
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
