@@ -50,7 +50,7 @@ use crate::structural::tempfiles::LanguagePathHint;
 use crate::structural_worker::StructuralDiffCoordinator;
 use crate::syntax::DEFAULT_THEME;
 use crate::syntax_worker::{SideRequest, SyntaxHighlightCoordinator};
-use crate::view::build_unified_lines_with_overlay;
+use crate::view::{SplitLines, build_split_lines, build_unified_lines_with_overlay};
 use crate::watch::EventBatch;
 use crate::watch::runtime::{WatchCoordinator, WatchUpdate};
 use crate::worker::LineDiffCoordinator;
@@ -68,6 +68,10 @@ const SYNTAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 // sidebar entirely before it would squeeze the diff below 42 columns.
 const SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_MIN_BODY_WIDTH: u16 = 72;
+// Below this many columns of diff area (after the sidebar), a split view
+// would leave under ~60 columns per side; the view falls back to unified
+// while remembering the user's preference for when the terminal widens.
+const SPLIT_MIN_CONTENT_WIDTH: u16 = 120;
 // Metrics are diagnostic and may run for a long session. Bound sample storage
 // independently of the number of input events.
 const MAX_METRIC_SAMPLES: usize = 100_000;
@@ -103,6 +107,13 @@ impl From<io::Error> for AppError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+/// What the diff body renders this frame: one unified column, or two
+/// side-by-side columns built from the same row table.
+enum BodyContent<'a> {
+    Single(Vec<Line<'a>>),
+    Split(SplitLines<'a>),
 }
 
 /// One scheduled re-read of a pair whose worktree side kept changing while
@@ -159,6 +170,9 @@ enum RequestedView<'a> {
 /// so raw mode is also restored after errors and panics.
 pub struct App {
     files: Vec<FileModel>,
+    /// The user's split/unified choice. Narrow terminals force unified for
+    /// display without touching this, so re-widening restores the choice.
+    split_preference: bool,
     /// Generation of `files`. Bumped by every re-discover; background load
     /// results from an older generation are rejected outright because their
     /// file indices may point at different files now.
@@ -232,6 +246,7 @@ impl App {
             .collect();
         let mut app = Self {
             files,
+            split_preference: false,
             snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
@@ -638,8 +653,8 @@ impl App {
             if dirty {
                 let build_started = Instant::now();
                 let body_height = body_height(terminal_area.height);
-                let title = self.title();
-                let body = self.body_lines(body_height);
+                let title = self.title(terminal_area.width);
+                let body = self.body_content(body_height, terminal_area.width);
                 let sidebar = self.sidebar_for_body(body_height, terminal_area.width);
                 let content_kind = self.visible_content_kind();
                 record_metric(
@@ -734,8 +749,24 @@ impl App {
                 self.previous_file();
                 true
             }
+            KeyCode::Char('s') => {
+                self.split_preference = !self.split_preference;
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Whether this frame renders side by side: the user asked for split
+    /// and the diff area is wide enough to hold two readable columns.
+    fn split_active(&self, terminal_width: u16) -> bool {
+        self.split_preference
+            && diff_content_width(terminal_width, self.sidebar_shown(terminal_width))
+                >= SPLIT_MIN_CONTENT_WIDTH
+    }
+
+    fn sidebar_shown(&self, terminal_width: u16) -> bool {
+        self.visible_file_count() > 0 && terminal_width >= SIDEBAR_MIN_BODY_WIDTH
     }
 
     fn handle_resize(&mut self, width: u16, height: u16) -> Size {
@@ -751,7 +782,7 @@ impl App {
         &'a self,
         frame: &mut ratatui::Frame<'_>,
         title: String,
-        body: Vec<Line<'a>>,
+        body: BodyContent<'a>,
         sidebar: Option<Vec<Line<'static>>>,
     ) {
         let chunks = Layout::default()
@@ -776,9 +807,23 @@ impl App {
                 sidebar_area,
             );
         }
-        frame.render_widget(Paragraph::new(body), content);
+        match body {
+            BodyContent::Single(lines) => {
+                frame.render_widget(Paragraph::new(lines), content);
+            }
+            BodyContent::Split(split) => {
+                let (left, right) = split_areas(content);
+                // Paragraphs clip at their area edge, so overlong rows are
+                // truncated per column at character-cell boundaries.
+                frame.render_widget(
+                    Paragraph::new(split.left).block(Block::default().borders(Borders::RIGHT)),
+                    left,
+                );
+                frame.render_widget(Paragraph::new(split.right), right);
+            }
+        }
         frame.render_widget(
-            Paragraph::new(" j/k scroll  [/] hunk  n/p file  PgUp/PgDn  q/Ctrl-C quit ")
+            Paragraph::new(" j/k scroll  [/] hunk  n/p file  s split  PgUp/PgDn  q/Ctrl-C quit ")
                 .style(Style::default().fg(Color::DarkGray)),
             chunks[2],
         );
@@ -789,20 +834,29 @@ impl App {
             .then(|| self.sidebar_lines(height, SIDEBAR_WIDTH))
     }
 
+    /// Test convenience: the unified body lines (width 0 never splits).
+    #[cfg(test)]
     fn body_lines(&self, height: usize) -> Vec<Line<'_>> {
+        match self.body_content(height, 0) {
+            BodyContent::Single(lines) => lines,
+            BodyContent::Split(_) => unreachable!("width 0 never activates split"),
+        }
+    }
+
+    fn body_content(&self, height: usize, terminal_width: u16) -> BodyContent<'_> {
         if self.visible_file_count() == 0 {
-            return vec![Line::from(self.no_changes_message())];
+            return BodyContent::Single(vec![Line::from(self.no_changes_message())]);
         }
         let Some(file) = self.files.get(self.selected) else {
-            return vec![Line::from(self.no_changes_message())];
+            return BodyContent::Single(vec![Line::from(self.no_changes_message())]);
         };
         if let Some(error) = &file.load_error {
-            return vec![Line::from(format!("Cannot read file: {error}"))];
+            return BodyContent::Single(vec![Line::from(format!("Cannot read file: {error}"))]);
         }
         let Some(content) = &self.current_content else {
-            return vec![Line::from("Loading content…")];
+            return BodyContent::Single(vec![Line::from("Loading content…")]);
         };
-        match self.worker.state() {
+        let lines = match self.worker.state() {
             AsyncState::NotRequested | AsyncState::Pending { .. } => {
                 vec![Line::from("Computing line diff…")]
             }
@@ -815,11 +869,8 @@ impl App {
                 ))]
             }
             AsyncState::Failed(error) => vec![Line::from(format!("Line diff failed: {error:?}"))],
-            AsyncState::Ready(rows) => build_unified_lines_with_overlay(
-                rows,
-                content.old.as_ref().expect("ready old text"),
-                content.new.as_ref().expect("ready new text"),
-                RowOverlays {
+            AsyncState::Ready(rows) => {
+                let overlays = RowOverlays {
                     structural: match self.structural_worker.state() {
                         AsyncState::Ready(overlay) => Some(overlay.as_ref()),
                         _ => None,
@@ -832,13 +883,21 @@ impl App {
                         AsyncState::Ready(spans) => Some(spans.as_ref()),
                         _ => None,
                     },
-                },
+                };
+                let old = content.old.as_ref().expect("ready old text");
+                let new = content.new.as_ref().expect("ready new text");
                 // A scroll preserved across a watch refresh may exceed the
                 // new diff; clamp for display, keys clamp the stored value.
-                self.scroll.min(max_scroll_for_rows(rows.len(), height)),
-                height,
-            ),
-        }
+                let offset = self.scroll.min(max_scroll_for_rows(rows.len(), height));
+                if self.split_active(terminal_width) {
+                    return BodyContent::Split(build_split_lines(
+                        rows, old, new, overlays, offset, height,
+                    ));
+                }
+                build_unified_lines_with_overlay(rows, old, new, overlays, offset, height)
+            }
+        };
+        BodyContent::Single(lines)
     }
 
     fn sidebar_lines(&self, height: usize, width: u16) -> Vec<Line<'static>> {
@@ -883,26 +942,38 @@ impl App {
         }
     }
 
-    fn title(&self) -> String {
-        let prefix = match &self.comparison_label {
-            Some(label) => format!(" tsuiku  {label}  "),
-            None => " tsuiku  ".to_owned(),
-        };
+    fn title(&self, terminal_width: u16) -> String {
+        let mut prefix = " tsuiku  ".to_owned();
+        // A split request the width cannot honor would otherwise look like
+        // a dead key: say why the view stayed unified. The explanation
+        // leads the title, ahead of *every* variable-length field — the
+        // comparison label is a user-supplied revision expression of
+        // unbounded length, and the file and structural fields grow too;
+        // anywhere later the paragraph clips the explanation first, and it
+        // matters most on exactly the narrow terminals that clip. Nine
+        // columns of app name plus this phrase fit 60 columns.
+        if self.split_preference && !self.split_active(terminal_width) {
+            prefix.push_str("split: needs a wider terminal  ");
+        }
+        if let Some(label) = &self.comparison_label {
+            prefix.push_str(label);
+            prefix.push_str("  ");
+        }
         // The stop reason (inotify limits, a lost repository, …) is what the
         // user needs in order to react; it comes from error strings that can
         // embed file names, so it must be escaped before reaching the
         // terminal. Overlong reasons are clipped by the terminal width.
-        let watch = match &self.watch_notice {
+        let notices = match &self.watch_notice {
             Some(reason) => format!("  watch: off ({})", terminal_safe_label(reason)),
             None => String::new(),
         };
         let visible_count = self.visible_file_count();
         if visible_count == 0 {
             // A start failure on a clean tree must stay visible too.
-            return format!("{prefix}no changes{watch} ");
+            return format!("{prefix}no changes{notices} ");
         }
         let Some(file) = self.files.get(self.selected) else {
-            return format!("{prefix}no changes{watch} ");
+            return format!("{prefix}no changes{notices} ");
         };
         let ordinal = self
             .files
@@ -922,7 +993,7 @@ impl App {
             }
             AsyncState::Ready(overlay) => {
                 return format!(
-                    "{prefix}[{ordinal}/{visible_count}] {}  structural: {} {}/{}{watch} ",
+                    "{prefix}[{ordinal}/{visible_count}] {}  structural: {} {}/{}{notices} ",
                     file_label(&file.change),
                     terminal_safe_label(&overlay.language),
                     overlay.diagnostics.accepted,
@@ -940,7 +1011,7 @@ impl App {
             AsyncState::Failed(_) => "  structural: failed",
         };
         format!(
-            "{prefix}[{ordinal}/{visible_count}] {}{structural}{watch} ",
+            "{prefix}[{ordinal}/{visible_count}] {}{structural}{notices} ",
             file_label(&file.change),
         )
     }
@@ -1037,6 +1108,25 @@ fn adjacent_prefetch_candidate(
 
 fn body_height(terminal_height: u16) -> usize {
     terminal_height.saturating_sub(CHROME_HEIGHT) as usize
+}
+
+/// Columns left for the diff body once the sidebar takes its share.
+fn diff_content_width(terminal_width: u16, sidebar_shown: bool) -> u16 {
+    if sidebar_shown {
+        terminal_width.saturating_sub(SIDEBAR_WIDTH)
+    } else {
+        terminal_width
+    }
+}
+
+/// Halve the diff area for the split view; the divider is the left
+/// column's right border, so an odd column goes to the right side.
+fn split_areas(content: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(content.width / 2), Constraint::Min(1)])
+        .split(content);
+    (chunks[0], chunks[1])
 }
 
 fn body_areas(area: Rect, show_sidebar: bool) -> (Option<Rect>, Rect) {
@@ -1315,6 +1405,7 @@ mod tests {
                     load_error: None,
                 },
             ],
+            split_preference: false,
             snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
@@ -1511,8 +1602,8 @@ mod tests {
         wide.draw(|frame| {
             app.draw(
                 frame,
-                app.title(),
-                vec![Line::from("diff body")],
+                app.title(80),
+                BodyContent::Single(vec![Line::from("diff body")]),
                 wide_sidebar,
             )
         })
@@ -1538,8 +1629,8 @@ mod tests {
             .draw(|frame| {
                 app.draw(
                     frame,
-                    app.title(),
-                    vec![Line::from("diff body")],
+                    app.title(80),
+                    BodyContent::Single(vec![Line::from("diff body")]),
                     narrow_sidebar,
                 )
             })
@@ -1774,11 +1865,14 @@ mod tests {
         let mut app = test_app();
         app.comparison_label = Some("comparing HEAD^1..HEAD".to_owned());
         assert_eq!(
-            app.title(),
+            app.title(80),
             " tsuiku  comparing HEAD^1..HEAD  [1/2] A a [None → Some(Submodule)] "
         );
         app.files.iter_mut().for_each(|file| file.no_op = true);
-        assert_eq!(app.title(), " tsuiku  comparing HEAD^1..HEAD  no changes ");
+        assert_eq!(
+            app.title(80),
+            " tsuiku  comparing HEAD^1..HEAD  no changes "
+        );
         assert_eq!(
             app.body_lines(10)[0].spans[0].content,
             "No changes in this comparison."
@@ -1797,7 +1891,7 @@ mod tests {
     fn title_reports_no_changes_when_every_candidate_resolves_to_no_op() {
         let mut app = test_app();
         app.files.iter_mut().for_each(|file| file.no_op = true);
-        assert_eq!(app.title(), " tsuiku  no changes ");
+        assert_eq!(app.title(80), " tsuiku  no changes ");
         assert_eq!(
             app.body_lines(10)[0].spans[0].content,
             "Working tree is clean."
@@ -1968,7 +2062,7 @@ mod tests {
         );
         assert!(app.watch.is_none());
         assert!(
-            app.title()
+            app.title(80)
                 .contains("watch: off (inotify watch limit reached)"),
             "the stop reason must be displayed, not just the fact"
         );
@@ -1981,7 +2075,7 @@ mod tests {
         app.handle_watch_update(WatchUpdate::Degraded {
             reason: "gone".to_owned(),
         });
-        assert_eq!(app.title(), " tsuiku  no changes  watch: off (gone) ");
+        assert_eq!(app.title(80), " tsuiku  no changes  watch: off (gone) ");
     }
 
     #[test]
@@ -1990,7 +2084,7 @@ mod tests {
         app.handle_watch_update(WatchUpdate::Degraded {
             reason: "bad\u{1b}[31mpath".to_owned(),
         });
-        let title = app.title();
+        let title = app.title(80);
         assert!(title.contains(r"bad\u{1b}[31mpath"));
         assert!(!title.contains('\u{1b}'));
     }
@@ -2351,6 +2445,242 @@ mod tests {
         ));
         app.request_selected();
         assert!(app.files[0].load_error.is_none());
+    }
+
+    #[test]
+    fn split_activates_only_at_the_content_width_threshold() {
+        let mut app = test_app();
+        app.split_preference = true;
+
+        // With the sidebar (30 columns), the boundary sits at terminal
+        // width 150: content 119 stays unified, 120 splits.
+        assert!(app.sidebar_shown(149));
+        assert!(!app.split_active(149));
+        assert!(app.split_active(150));
+
+        // Without files there is no sidebar; the boundary is the terminal
+        // width itself.
+        app.files.iter_mut().for_each(|file| file.no_op = true);
+        assert!(!app.sidebar_shown(149));
+        assert!(!app.split_active(119));
+        assert!(app.split_active(120));
+
+        // The preference alone never splits a narrow terminal, and turning
+        // it off never splits a wide one.
+        app.split_preference = false;
+        assert!(!app.split_active(300));
+    }
+
+    #[test]
+    fn an_unhonored_split_request_is_explained_in_the_title() {
+        let mut app = test_app();
+        app.split_preference = true;
+
+        assert!(
+            app.title(100).contains("split: needs a wider terminal"),
+            "a silently ignored toggle would look like a dead key"
+        );
+        assert!(
+            !app.title(160).contains("split:"),
+            "an honored split needs no explanation"
+        );
+
+        app.split_preference = false;
+        assert!(!app.title(100).contains("split:"));
+
+        // The explanation also survives the clean-tree early return.
+        app.split_preference = true;
+        app.files.iter_mut().for_each(|file| file.no_op = true);
+        assert!(app.title(100).contains("split: needs a wider terminal"));
+    }
+
+    #[test]
+    fn the_split_explanation_survives_rendering_on_narrow_terminals() {
+        // The string-level test above cannot see paragraph clipping; only
+        // the rendered buffer proves the phrase fits. A long path makes the
+        // variable-length fields compete for the same columns.
+        let mut app = test_app();
+        app.files[0].change.new_path = Some(GitPath::from_bytes(
+            b"deeply/nested/directories/with/a/very/long/file/name/component.rs",
+        ));
+        app.split_preference = true;
+
+        for width in [60u16, 80, 149] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("test terminal");
+            let body = app.body_content(body_height(8), width);
+            let sidebar = app.sidebar_for_body(body_height(8), width);
+            terminal
+                .draw(|frame| app.draw(frame, app.title(width), body, sidebar))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width)
+                .map(|x| buffer.cell((x, 0)).expect("title cell").symbol().to_owned())
+                .collect();
+            assert!(
+                row.contains("split: needs a wider terminal"),
+                "width {width}: the rendered title must keep the phrase, got {row:?}"
+            );
+        }
+
+        // A long user-supplied revision expression must not push the
+        // explanation off screen either: it precedes the comparison label.
+        app.comparison_label = Some(format!(
+            "comparing {rev}^1..{rev}",
+            rev = "HEAD^0^0^0^0^0^0^0^0^0^0^0^{commit}"
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("test terminal");
+        let body = app.body_content(body_height(8), 60);
+        let sidebar = app.sidebar_for_body(body_height(8), 60);
+        terminal
+            .draw(|frame| app.draw(frame, app.title(60), body, sidebar))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..60)
+            .map(|x| buffer.cell((x, 0)).expect("title cell").symbol().to_owned())
+            .collect();
+        assert!(
+            row.contains("split: needs a wider terminal"),
+            "a long comparison label must not hide the phrase, got {row:?}"
+        );
+        app.comparison_label = None;
+
+        // Wide enough to split: the rendered title carries no explanation.
+        let mut terminal = Terminal::new(TestBackend::new(170, 8)).expect("test terminal");
+        let body = app.body_content(body_height(8), 170);
+        let sidebar = app.sidebar_for_body(body_height(8), 170);
+        terminal
+            .draw(|frame| app.draw(frame, app.title(170), body, sidebar))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..170)
+            .map(|x| buffer.cell((x, 0)).expect("title cell").symbol().to_owned())
+            .collect();
+        assert!(!row.contains("split:"));
+    }
+
+    #[test]
+    fn narrow_terminals_force_unified_but_keep_the_preference() {
+        let mut app = test_app();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), 10));
+        assert!(app.split_preference);
+
+        assert!(!app.split_active(100), "narrow width forces unified");
+        assert!(
+            app.split_active(160),
+            "re-widening restores the user's split choice"
+        );
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), 10));
+        assert!(!app.split_preference);
+    }
+
+    #[test]
+    fn toggling_split_preserves_the_scroll_position() {
+        let mut app = test_app();
+        let source = (0..100).map(|line| format!("{line}\n")).collect::<String>();
+        app.activate_content(prepared_text(&source, &source));
+        wait_for_line_diff(&mut app);
+        app.scroll = 42;
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), 10));
+        assert_eq!(app.scroll, 42);
+        // Both modes share the row table, so the clamp bound is identical.
+        assert_eq!(app.max_scroll(10), 90);
+    }
+
+    #[test]
+    fn split_draw_places_the_divider_and_both_columns() {
+        let mut app = test_app();
+        app.split_preference = true;
+        app.activate_content(prepared_text("old line\ncommon\n", "new line\ncommon\n"));
+        wait_for_line_diff(&mut app);
+
+        // 160 wide: sidebar 30, content 130 → left column 65 (divider in
+        // its last cell), right column 65.
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).expect("test terminal");
+        let body = app.body_content(body_height(10), 160);
+        assert!(matches!(body, BodyContent::Split(_)));
+        let sidebar = app.sidebar_for_body(body_height(10), 160);
+        terminal
+            .draw(|frame| app.draw(frame, app.title(160), body, sidebar))
+            .expect("split draw");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((29, 2)).expect("sidebar border").symbol(), "│");
+        assert_eq!(
+            buffer.cell((30 + 64, 2)).expect("split divider").symbol(),
+            "│",
+            "the divider sits in the last cell of the left column"
+        );
+        // First body row: the removed old line on the left with a blank
+        // right; second row: blank left with the added new line right.
+        let row_text = |y: u16| -> String {
+            (30..160)
+                .map(|x| buffer.cell((x, y)).expect("body cell").symbol().to_owned())
+                .collect()
+        };
+        let removed_row = row_text(2);
+        assert!(
+            removed_row.contains("1 - old line"),
+            "left column shows the old side: {removed_row}"
+        );
+        assert!(
+            !removed_row.contains("new line"),
+            "the removed row's right column stays blank: {removed_row}"
+        );
+        let added_row = row_text(3);
+        assert!(
+            added_row.contains("1 + new line"),
+            "right column shows the new side: {added_row}"
+        );
+        assert!(
+            !added_row.contains("old line"),
+            "the added row's left column stays blank: {added_row}"
+        );
+
+        // Odd content width: 161 → content 131, left 65, right 66.
+        let mut odd = Terminal::new(TestBackend::new(161, 10)).expect("test terminal");
+        let body = app.body_content(body_height(10), 161);
+        let sidebar = app.sidebar_for_body(body_height(10), 161);
+        odd.draw(|frame| app.draw(frame, app.title(160), body, sidebar))
+            .expect("odd-width draw");
+        assert_eq!(
+            odd.backend()
+                .buffer()
+                .cell((30 + 64, 2))
+                .expect("odd divider")
+                .symbol(),
+            "│"
+        );
+    }
+
+    #[test]
+    fn split_columns_truncate_cjk_at_character_boundaries() {
+        let mut app = test_app();
+        app.split_preference = true;
+        let long = format!("日本語の長い行を{}続ける\n", "漢字".repeat(40));
+        app.activate_content(prepared_text(&long, "short\n"));
+        wait_for_line_diff(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).expect("test terminal");
+        let body = app.body_content(body_height(10), 160);
+        let sidebar = app.sidebar_for_body(body_height(10), 160);
+        terminal
+            .draw(|frame| app.draw(frame, app.title(160), body, sidebar))
+            .expect("cjk split draw");
+        let buffer = terminal.backend().buffer();
+
+        // The divider survives an overlong CJK row: the wide character that
+        // would straddle the boundary is dropped, never split in half.
+        assert_eq!(
+            buffer.cell((30 + 64, 2)).expect("divider").symbol(),
+            "│",
+            "an overlong CJK line must not overwrite the divider"
+        );
+        let last_content = buffer.cell((30 + 63, 2)).expect("cell before divider");
+        assert!(
+            last_content.symbol().chars().count() <= 1,
+            "no half character at the truncation point"
+        );
     }
 
     #[test]

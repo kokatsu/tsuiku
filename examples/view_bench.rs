@@ -23,7 +23,7 @@ use tsuiku::structural::normalize::{StructuralOverlay, normalize};
 use tsuiku::structural::tempfiles::LanguagePathHint;
 use tsuiku::syntax::{DEFAULT_THEME, HighlightAssets, HighlightOutcome, SyntaxSpans};
 use tsuiku::text::{ClassifiedContent, TextContent, classify};
-use tsuiku::view::{build_unified_lines, build_unified_lines_with_overlay};
+use tsuiku::view::{build_split_lines, build_unified_lines, build_unified_lines_with_overlay};
 
 fn text(source: String) -> TextContent {
     match classify(Arc::from(source.into_bytes())) {
@@ -110,6 +110,7 @@ fn main() {
     let mut plain = Vec::with_capacity(offsets.len());
     let mut with_overlay = Vec::with_capacity(offsets.len());
     let mut with_syntax = Vec::with_capacity(offsets.len());
+    let mut split = Vec::with_capacity(offsets.len());
     for (iteration, &offset) in offsets.iter().enumerate() {
         let start = Instant::now();
         black_box(build_unified_lines(&rows, &old, &new, offset, 50));
@@ -132,11 +133,16 @@ fn main() {
         ));
         let syntax_elapsed = start.elapsed().as_nanos();
 
+        let start = Instant::now();
+        black_box(build_split_lines(&rows, &old, &new, full, offset, 50));
+        let split_elapsed = start.elapsed().as_nanos();
+
         // Discard the warm-up prefix rather than the fixture's cold pages.
         if iteration >= 1_000 {
             plain.push(plain_elapsed);
             with_overlay.push(overlay_elapsed);
             with_syntax.push(syntax_elapsed);
+            split.push(split_elapsed);
         }
     }
     println!(
@@ -150,5 +156,9 @@ fn main() {
     println!(
         "METRIC visible_frame_syntax_p95_ns={}",
         percentile(&mut with_syntax, 95)
+    );
+    println!(
+        "METRIC visible_frame_split_p95_ns={}",
+        percentile(&mut split, 95)
     );
 }
