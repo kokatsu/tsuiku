@@ -8,10 +8,11 @@
 
 use std::sync::Arc;
 
-use crate::ids::ContentPairId;
+use crate::ids::{ContentId, ContentPairId};
 use crate::linediff::DiffRow;
 use crate::structural::normalize::StructuralOverlay;
 use crate::structural::tempfiles::LanguagePathHint;
+use crate::syntax::{SyntaxSpans, ThemeId};
 
 /// Monotonic id for one in-flight worker request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -32,6 +33,7 @@ pub enum AsyncState<T, Skip, Err> {
 
 pub type LineDiffState = AsyncState<Arc<[DiffRow]>, LineDiffUnavailable, LineDiffError>;
 pub type StructuralDiffState = AsyncState<Arc<StructuralOverlay>, StructuralSkip, StructuralError>;
+pub type SyntaxHighlightState = AsyncState<Arc<SyntaxSpans>, SyntaxSkip, SyntaxError>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineDiffUnavailable {
@@ -73,8 +75,24 @@ pub enum StructuralError {
     Io,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyntaxSkip {
+    UnsupportedLanguage,
+    SizeLimited,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyntaxError {
+    /// syntect failed to parse or apply scopes for this content.
+    HighlightFailed,
+    WorkerGone,
+}
+
 /// Bump when the line splitting / line index contract changes.
 pub const LINE_MODEL_VERSION: u32 = 1;
+
+/// Bump when the syntect span extraction rules change.
+pub const HIGHLIGHTER_VERSION: u32 = 1;
 
 /// Bump when the difft JSON normalization rules change.
 pub const NORMALIZER_VERSION: u32 = 1;
@@ -91,6 +109,17 @@ pub struct LineDiffCacheKey {
     pub engine: LineDiffEngineId,
     pub options_fingerprint: u64,
     pub line_model_version: u32,
+}
+
+/// Cache key for one highlighted side. Keyed by `ContentId`, not the pair:
+/// old and new hit the cache independently.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SyntaxHighlightCacheKey {
+    pub content: ContentId,
+    pub language_hint: LanguagePathHint,
+    pub theme_id: ThemeId,
+    pub highlighter_version: u32,
+    pub options_fingerprint: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

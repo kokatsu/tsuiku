@@ -5,9 +5,10 @@
 //! `Line`/`Span` values; it excludes line-diff computation and terminal backend
 //! drawing.
 //!
-//! Both frame paths are measured: without a structural overlay, and with one
-//! that covers every row, which is the worst case for span splitting (a real
-//! overlay decorates only changed lines).
+//! Three frame paths are measured: without overlays, with a structural
+//! overlay covering every row (the worst case for span splitting; a real
+//! overlay decorates only changed lines), and with syntax spans for both
+//! sides stacked on top of that overlay.
 //!
 //! Run with `cargo run --release --example view_bench`.
 
@@ -15,9 +16,12 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tsuiku::compose::RowOverlays;
 use tsuiku::linediff::{DEFAULT_ENGINE, engine, line_tokens};
 use tsuiku::structural::json::parse;
 use tsuiku::structural::normalize::{StructuralOverlay, normalize};
+use tsuiku::structural::tempfiles::LanguagePathHint;
+use tsuiku::syntax::{DEFAULT_THEME, HighlightAssets, HighlightOutcome, SyntaxSpans};
 use tsuiku::text::{ClassifiedContent, TextContent, classify};
 use tsuiku::view::{build_unified_lines, build_unified_lines_with_overlay};
 
@@ -33,14 +37,12 @@ fn percentile(samples: &mut [u128], percentile: usize) -> u128 {
     samples[(samples.len() - 1) * percentile / 100]
 }
 
-/// One accepted span on every line of `new`, covering the leading word.
+/// One accepted span on every line of `new`, covering the leading keyword.
 fn dense_overlay(new: &TextContent, lines: usize) -> StructuralOverlay {
     let entries: Vec<String> = (0..lines)
         .map(|i| {
-            let word = if i % 50 == 0 { "changed" } else { "old" };
             format!(
-                r#"{{"rhs":{{"line_number":{i},"changes":[{{"start":0,"end":{},"content":"{word}","highlight":"keyword"}}]}}}}"#,
-                word.len()
+                r#"{{"rhs":{{"line_number":{i},"changes":[{{"start":0,"end":3,"content":"let","highlight":"keyword"}}]}}}}"#
             )
         })
         .collect();
@@ -56,15 +58,30 @@ fn dense_overlay(new: &TextContent, lines: usize) -> StructuralOverlay {
     overlay
 }
 
+fn rust_syntax(content: &TextContent) -> Arc<SyntaxSpans> {
+    let hint = LanguagePathHint {
+        extension: Some(b"rs".to_vec()),
+        basename: Some(b"bench.rs".to_vec()),
+    };
+    match HighlightAssets::load().highlight(content, &hint, DEFAULT_THEME) {
+        HighlightOutcome::Ready(spans) => spans,
+        _ => unreachable!("rust fixture must highlight"),
+    }
+}
+
 fn main() {
-    let old = text((0..20_000).map(|i| format!("old line {i}\n")).collect());
+    let old = text(
+        (0..20_000)
+            .map(|i| format!("let item_{i} = \"old\"; // note\n"))
+            .collect(),
+    );
     let new = text(
         (0..20_000)
             .map(|i| {
                 if i % 50 == 0 {
-                    format!("changed line {i}\n")
+                    format!("let item_{i} = \"changed\"; // note\n")
                 } else {
-                    format!("old line {i}\n")
+                    format!("let item_{i} = \"old\"; // note\n")
                 }
             })
             .collect(),
@@ -75,11 +92,24 @@ fn main() {
         .collect();
 
     let overlay = dense_overlay(&new, 20_000);
+    let syntax_old = rust_syntax(&old);
+    let syntax_new = rust_syntax(&new);
+    let structural_only = RowOverlays {
+        structural: Some(&overlay),
+        syntax_old: None,
+        syntax_new: None,
+    };
+    let full = RowOverlays {
+        structural: Some(&overlay),
+        syntax_old: Some(&syntax_old),
+        syntax_new: Some(&syntax_new),
+    };
 
-    // Both variants are timed in one interleaved loop: measuring them in
-    // sequence made whichever ran second look faster purely from warm-up.
+    // All variants are timed in one interleaved loop: measuring them in
+    // sequence made whichever ran later look faster purely from warm-up.
     let mut plain = Vec::with_capacity(offsets.len());
     let mut with_overlay = Vec::with_capacity(offsets.len());
+    let mut with_syntax = Vec::with_capacity(offsets.len());
     for (iteration, &offset) in offsets.iter().enumerate() {
         let start = Instant::now();
         black_box(build_unified_lines(&rows, &old, &new, offset, 50));
@@ -90,16 +120,23 @@ fn main() {
             &rows,
             &old,
             &new,
-            Some(&overlay),
+            structural_only,
             offset,
             50,
         ));
         let overlay_elapsed = start.elapsed().as_nanos();
 
+        let start = Instant::now();
+        black_box(build_unified_lines_with_overlay(
+            &rows, &old, &new, full, offset, 50,
+        ));
+        let syntax_elapsed = start.elapsed().as_nanos();
+
         // Discard the warm-up prefix rather than the fixture's cold pages.
         if iteration >= 1_000 {
             plain.push(plain_elapsed);
             with_overlay.push(overlay_elapsed);
+            with_syntax.push(syntax_elapsed);
         }
     }
     println!(
@@ -109,5 +146,9 @@ fn main() {
     println!(
         "METRIC visible_frame_overlay_p95_ns={}",
         percentile(&mut with_overlay, 95)
+    );
+    println!(
+        "METRIC visible_frame_syntax_p95_ns={}",
+        percentile(&mut with_syntax, 95)
     );
 }

@@ -34,18 +34,22 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::asyncstate::{
-    AsyncState, LINE_MODEL_VERSION, LineDiffCacheKey, LineDiffEngineId, LineDiffUnavailable,
-    StructuralSkip,
+    AsyncState, HIGHLIGHTER_VERSION, LINE_MODEL_VERSION, LineDiffCacheKey, LineDiffEngineId,
+    LineDiffUnavailable, StructuralSkip, SyntaxHighlightCacheKey,
 };
 use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
+use crate::compose::RowOverlays;
 use crate::discover::{CommitRevision, GixDiscoverer};
+use crate::ids::ContentIdentity;
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
 use crate::path::GitPath;
 use crate::resolve::{GixResolver, ResolveError};
 use crate::structural::normalize::DifftStatus;
 use crate::structural::tempfiles::LanguagePathHint;
 use crate::structural_worker::StructuralDiffCoordinator;
+use crate::syntax::DEFAULT_THEME;
+use crate::syntax_worker::{SideRequest, SyntaxHighlightCoordinator};
 use crate::view::build_unified_lines_with_overlay;
 use crate::worker::LineDiffCoordinator;
 
@@ -57,6 +61,7 @@ const CHROME_HEIGHT: u16 = 3;
 const CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LINE_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURAL_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const SYNTAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 // Preserve a useful diff body on an 80-column terminal, and remove the
 // sidebar entirely before it would squeeze the diff below 42 columns.
 const SIDEBAR_WIDTH: u16 = 30;
@@ -146,6 +151,7 @@ pub struct App {
     current_content: Option<Arc<PreparedContent>>,
     worker: LineDiffCoordinator,
     structural_worker: StructuralDiffCoordinator,
+    syntax_worker: SyntaxHighlightCoordinator,
     comparison_label: Option<String>,
     started_at: Instant,
     terminal_initialized_micros: Cell<Option<u64>>,
@@ -204,6 +210,7 @@ impl App {
             current_content: None,
             worker: LineDiffCoordinator::new(LINE_DIFF_CACHE_BYTES),
             structural_worker: StructuralDiffCoordinator::new(STRUCTURAL_DIFF_CACHE_BYTES),
+            syntax_worker: SyntaxHighlightCoordinator::new(SYNTAX_CACHE_BYTES),
             comparison_label,
             started_at,
             terminal_initialized_micros: Cell::new(None),
@@ -225,6 +232,7 @@ impl App {
         self.current_content = None;
         self.worker.reset();
         self.structural_worker.reset();
+        self.syntax_worker.reset();
         let Some(file) = self.files.get_mut(self.selected) else {
             return;
         };
@@ -259,20 +267,26 @@ impl App {
                     Arc::clone(content.new.as_ref().expect("text new side")),
                 );
                 let change = &self.files[self.selected].change;
+                let old_hint = change
+                    .old_path
+                    .as_ref()
+                    .map(LanguagePathHint::from_git_path)
+                    .unwrap_or_else(LanguagePathHint::none);
+                let new_hint = change
+                    .new_path
+                    .as_ref()
+                    .map(LanguagePathHint::from_git_path)
+                    .unwrap_or_else(LanguagePathHint::none);
                 self.structural_worker.request(
                     content.pair,
-                    change
-                        .old_path
-                        .as_ref()
-                        .map(LanguagePathHint::from_git_path)
-                        .unwrap_or_else(LanguagePathHint::none),
-                    change
-                        .new_path
-                        .as_ref()
-                        .map(LanguagePathHint::from_git_path)
-                        .unwrap_or_else(LanguagePathHint::none),
+                    old_hint.clone(),
+                    new_hint.clone(),
                     Arc::clone(content.old.as_ref().expect("text old side")),
                     Arc::clone(content.new.as_ref().expect("text new side")),
+                );
+                self.syntax_worker.request(
+                    syntax_side(content.pair.old, old_hint, content.old.as_ref()),
+                    syntax_side(content.pair.new, new_hint, content.new.as_ref()),
                 );
             }
         }
@@ -298,6 +312,7 @@ impl App {
                         self.current_content = None;
                         self.worker.reset();
                         self.structural_worker.reset();
+                        self.syntax_worker.reset();
                     }
                 } else {
                     // The prefetched candidate disappeared from navigation.
@@ -343,6 +358,7 @@ impl App {
         // visible. Content results use file_id for the equivalent check below.
         let mut dirty = self.worker.poll();
         dirty |= self.structural_worker.poll();
+        dirty |= self.syntax_worker.poll();
         loop {
             let result = self
                 .resolver
@@ -609,9 +625,19 @@ impl App {
                 rows,
                 content.old.as_ref().expect("ready old text"),
                 content.new.as_ref().expect("ready new text"),
-                match self.structural_worker.state() {
-                    AsyncState::Ready(overlay) => Some(overlay.as_ref()),
-                    _ => None,
+                RowOverlays {
+                    structural: match self.structural_worker.state() {
+                        AsyncState::Ready(overlay) => Some(overlay.as_ref()),
+                        _ => None,
+                    },
+                    syntax_old: match self.syntax_worker.old_state() {
+                        AsyncState::Ready(spans) => Some(spans.as_ref()),
+                        _ => None,
+                    },
+                    syntax_new: match self.syntax_worker.new_state() {
+                        AsyncState::Ready(spans) => Some(spans.as_ref()),
+                        _ => None,
+                    },
                 },
                 self.scroll,
                 height,
@@ -733,6 +759,28 @@ impl App {
             AsyncState::NotRequested | AsyncState::Pending { .. } => None,
         }
     }
+}
+
+/// The syntax request for one side, or `None` for an absent side (add or
+/// delete), which stays `NotRequested`.
+fn syntax_side(
+    identity: ContentIdentity,
+    hint: LanguagePathHint,
+    text: Option<&Arc<crate::text::TextContent>>,
+) -> Option<SideRequest> {
+    let ContentIdentity::Present(content) = identity else {
+        return None;
+    };
+    Some(SideRequest {
+        key: SyntaxHighlightCacheKey {
+            content,
+            language_hint: hint,
+            theme_id: DEFAULT_THEME,
+            highlighter_version: HIGHLIGHTER_VERSION,
+            options_fingerprint: 0,
+        },
+        text: Arc::clone(text.expect("text side present")),
+    })
 }
 
 fn requested_target(
@@ -1012,6 +1060,10 @@ impl Drop for App {
             "METRIC structural_diff_cache_bytes={}",
             self.structural_worker.cache_weight()
         );
+        eprintln!(
+            "METRIC syntax_cache_bytes={}",
+            self.syntax_worker.cache_weight()
+        );
         let (accepted, total) = self.structural_worker.diagnostic_totals();
         eprintln!("METRIC structural_spans_accepted={accepted}");
         eprintln!("METRIC structural_spans_total={total}");
@@ -1065,6 +1117,7 @@ mod tests {
             current_content: None,
             worker: LineDiffCoordinator::new(1024 * 1024),
             structural_worker: StructuralDiffCoordinator::new(1024 * 1024),
+            syntax_worker: SyntaxHighlightCoordinator::new(1024 * 1024),
             comparison_label: None,
             started_at: Instant::now(),
             terminal_initialized_micros: Cell::new(None),
@@ -1143,6 +1196,35 @@ mod tests {
             assert!(Instant::now() < deadline, "line diff did not finish");
             std::thread::yield_now();
         }
+    }
+
+    fn wait_for_syntax(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(app.syntax_worker.new_state(), AsyncState::Ready(_)) {
+            app.syntax_worker.poll();
+            assert!(Instant::now() < deadline, "syntax highlight did not finish");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn ready_syntax_highlight_colors_the_visible_body() {
+        let mut app = test_app();
+        app.files[0].change.new_path = Some(GitPath::from_bytes(b"a.rs"));
+        app.files[0].change.old_path = Some(GitPath::from_bytes(b"a.rs"));
+        app.activate_content(prepared_text(
+            "fn old() -> u32 { 1 } // note\n",
+            "fn new() -> u32 { 2 } // note\n",
+        ));
+        wait_for_line_diff(&mut app);
+        wait_for_syntax(&mut app);
+
+        let has_rgb_fg = app.body_lines(10).iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
+        });
+        assert!(has_rgb_fg, "a ready highlight must color at least one span");
     }
 
     #[test]

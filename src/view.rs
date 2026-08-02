@@ -4,9 +4,10 @@
 //! footer. The complete diff remains a compact `DiffRow` table; only rows that
 //! fit in the viewport are converted to ratatui `Line` and `Span` values.
 
-use crate::compose::{RowKind as ComposedRowKind, compose_row};
+use crate::compose::{RowKind as ComposedRowKind, RowOverlays, compose_row};
 use crate::linediff::DiffRow;
-use crate::structural::normalize::{HighlightKind, StructuralOverlay};
+use crate::structural::normalize::HighlightKind;
+use crate::syntax::SyntaxFg;
 use crate::text::TextContent;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -81,16 +82,17 @@ pub fn build_unified_lines<'a>(
     offset: usize,
     height: usize,
 ) -> Vec<Line<'a>> {
-    build_unified_lines_with_overlay(rows, old, new, None, offset, height)
+    build_unified_lines_with_overlay(rows, old, new, RowOverlays::default(), offset, height)
 }
 
-/// Build a viewport while applying validated structural spans. The line-diff
-/// row remains the sole source of layout; the overlay only decorates text.
+/// Build a viewport while applying validated structural and syntax spans.
+/// The line-diff row remains the sole source of layout; overlays only
+/// decorate text.
 pub fn build_unified_lines_with_overlay<'a>(
     rows: &'a [DiffRow],
     old: &'a TextContent,
     new: &'a TextContent,
-    overlay: Option<&'a StructuralOverlay>,
+    overlays: RowOverlays<'a>,
     offset: usize,
     height: usize,
 ) -> Vec<Line<'a>> {
@@ -100,7 +102,7 @@ pub fn build_unified_lines_with_overlay<'a>(
         .take(height)
         .copied()
         .map(|row| {
-            let row = compose_row(row, old, new, overlay);
+            let row = compose_row(row, old, new, overlays);
             let (marker, line_style) = match row.kind {
                 ComposedRowKind::Context => (' ', Style::default()),
                 ComposedRowKind::Removed => ('-', Style::default().bg(Color::Rgb(60, 20, 25))),
@@ -124,7 +126,7 @@ pub fn build_unified_lines_with_overlay<'a>(
             spans.extend(row.segments.into_iter().map(|segment| {
                 Span::styled(
                     segment.text,
-                    structural_style(line_style, segment.highlight),
+                    segment_style(line_style, segment.structural, segment.syntax),
                 )
             }));
             Line::from(spans)
@@ -132,21 +134,32 @@ pub fn build_unified_lines_with_overlay<'a>(
         .collect()
 }
 
-fn structural_style(base: Style, highlight: Option<HighlightKind>) -> Style {
-    let Some(highlight) = highlight else {
-        return base;
-    };
-    let foreground = match highlight {
-        HighlightKind::Keyword => Color::LightMagenta,
-        HighlightKind::String => Color::LightYellow,
-        HighlightKind::Comment => Color::Gray,
-        HighlightKind::Delimiter => Color::LightCyan,
-        HighlightKind::TypeName => Color::LightBlue,
-        HighlightKind::Normal | HighlightKind::Other => Color::White,
-    };
-    base.fg(foreground)
-        .bg(Color::Rgb(85, 65, 15))
-        .add_modifier(Modifier::BOLD)
+/// Style composition: an explicit structural foreground beats the syntax
+/// foreground, which beats the line-diff default; a structural background
+/// beats the line background; syntax never touches background or attributes.
+fn segment_style(
+    base: Style,
+    structural: Option<HighlightKind>,
+    syntax: Option<SyntaxFg>,
+) -> Style {
+    if let Some(highlight) = structural {
+        let foreground = match highlight {
+            HighlightKind::Keyword => Color::LightMagenta,
+            HighlightKind::String => Color::LightYellow,
+            HighlightKind::Comment => Color::Gray,
+            HighlightKind::Delimiter => Color::LightCyan,
+            HighlightKind::TypeName => Color::LightBlue,
+            HighlightKind::Normal | HighlightKind::Other => Color::White,
+        };
+        return base
+            .fg(foreground)
+            .bg(Color::Rgb(85, 65, 15))
+            .add_modifier(Modifier::BOLD);
+    }
+    match syntax {
+        Some(fg) => base.fg(Color::Rgb(fg.r, fg.g, fg.b)),
+        None => base,
+    }
 }
 
 fn decimal_width(value: usize) -> usize {
@@ -231,7 +244,17 @@ mod tests {
             new: crate::coords::LineIndex(0),
         }];
 
-        let lines = build_unified_lines_with_overlay(&rows, &old, &new, Some(&overlay), 0, 1);
+        let lines = build_unified_lines_with_overlay(
+            &rows,
+            &old,
+            &new,
+            RowOverlays {
+                structural: Some(&overlay),
+                ..RowOverlays::default()
+            },
+            0,
+            1,
+        );
 
         assert_eq!(lines[0].spans.len(), 4);
         assert_eq!(lines[0].spans[2].content, "new");
@@ -243,5 +266,30 @@ mod tests {
                 .contains(Modifier::BOLD)
         );
         assert_eq!(lines[0].spans[1].style.bg, Some(Color::Rgb(15, 55, 35)));
+    }
+
+    #[test]
+    fn composition_priority_follows_the_style_contract() {
+        let base = Style::default().bg(Color::Rgb(15, 55, 35));
+        let syntax = SyntaxFg {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+
+        // Syntax alone: foreground only, background and attributes untouched.
+        let syntax_only = segment_style(base, None, Some(syntax));
+        assert_eq!(syntax_only.fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(syntax_only.bg, base.bg);
+        assert_eq!(syntax_only.add_modifier, Modifier::empty());
+
+        // Structural beats syntax on foreground and the line bg on background.
+        let both = segment_style(base, Some(HighlightKind::String), Some(syntax));
+        assert_eq!(both.fg, Some(Color::LightYellow));
+        assert_eq!(both.bg, Some(Color::Rgb(85, 65, 15)));
+        assert!(both.add_modifier.contains(Modifier::BOLD));
+
+        // Neither layer: the line-diff style passes through unchanged.
+        assert_eq!(segment_style(base, None, None), base);
     }
 }

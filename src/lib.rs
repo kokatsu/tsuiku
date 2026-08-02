@@ -17,6 +17,8 @@ pub mod path;
 pub mod resolve;
 pub mod structural;
 pub mod structural_worker;
+pub mod syntax;
+pub mod syntax_worker;
 pub mod text;
 pub mod view;
 pub mod worker;
