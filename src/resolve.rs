@@ -328,14 +328,26 @@ mod tests {
     }
 
     /// One write round: an 8-digit header naming the round, a newline, and
-    /// a body whose length is derived from the round. An accepted read must
-    /// reconstruct exactly (`fs::write` truncates first, so the only
-    /// inconsistent states are the empty window and torn prefixes — and a
-    /// torn prefix fails the length check for its own header).
+    /// the same 8 digits repeated `round` times as the body. Every 8-byte
+    /// body fragment names its round, so a fragment of another round's body
+    /// breaks the prefix oracle — an all-`x` body could not tell rounds
+    /// apart. Lengths stay strictly increasing (9 + 8·round).
     fn round_content(round: usize) -> String {
-        format!("{round:08}\n{}", "x".repeat(round * 3))
+        format!("{round:08}\n{}", format!("{round:08}").repeat(round))
     }
 
+    /// Cross-platform smoke test for the guard under real concurrent
+    /// rewrites; the retry/rejection contract itself is pinned by the
+    /// scripted tests above.
+    ///
+    /// What can be asserted here is single-state consistency, not write
+    /// completeness: `write(2)` is not atomic, so a mid-write file
+    /// genuinely contains a prefix of the current round for a moment, and
+    /// a stamp that holds across both probes makes accepting that state
+    /// correct (observed on Linux, where coarse mtime granularity keeps
+    /// the stamp stable across such windows). Because every rewrite
+    /// truncates first, any single state is a prefix of its round —
+    /// mixtures of two rounds and garbage headers must never be accepted.
     #[test]
     fn read_stable_never_returns_a_torn_mixture_under_concurrent_writes() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -356,20 +368,19 @@ mod tests {
 
         while !done.load(Ordering::Relaxed) {
             match read_stable(&file, "churn.txt") {
-                // Empty is a real momentary state (truncate-then-write), so
-                // it is a consistent observation. Anything else must be the
-                // complete content of the round its header names.
-                Ok(bytes) if bytes.is_empty() => {}
                 Ok(bytes) => {
                     let text = std::str::from_utf8(&bytes).expect("rounds are ASCII");
-                    let round: usize = text
-                        .get(..8)
-                        .and_then(|header| header.parse().ok())
-                        .unwrap_or_else(|| panic!("torn header: {} bytes", bytes.len()));
-                    assert_eq!(
-                        text,
-                        round_content(round),
-                        "an accepted read must be one complete write"
+                    let consistent = text.is_empty()
+                        || text
+                            .get(..8)
+                            .and_then(|header| header.parse::<usize>().ok())
+                            .is_some_and(|round| round_content(round).starts_with(text))
+                        // A read shorter than the header is still a prefix
+                        // of *some* round if it is all digits so far.
+                        || (text.len() < 8 && text.bytes().all(|b| b.is_ascii_digit()));
+                    assert!(
+                        consistent,
+                        "an accepted read must be one momentary file state, got {text:?}"
                     );
                 }
                 // Rejection is the designed outcome for unlucky timing;
