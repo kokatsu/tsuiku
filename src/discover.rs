@@ -53,6 +53,12 @@ impl GixDiscoverer {
         self.paths.as_ref()
     }
 
+    /// The underlying repository, for consumers that need repository-level
+    /// facts (watch targets, ignore matching) alongside discovery.
+    pub fn repository(&self) -> &gix::Repository {
+        &self.repo
+    }
+
     /// Resolve a git revision expression and peel tags to a commit.
     pub fn resolve_commit_revision(
         &self,

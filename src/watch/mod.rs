@@ -9,6 +9,9 @@
 //! within one window must still reload the selected file).
 
 pub mod debounce;
+pub mod filter;
+pub mod runtime;
+pub mod targets;
 
 use std::collections::HashSet;
 

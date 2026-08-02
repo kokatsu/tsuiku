@@ -51,6 +51,8 @@ use crate::structural_worker::StructuralDiffCoordinator;
 use crate::syntax::DEFAULT_THEME;
 use crate::syntax_worker::{SideRequest, SyntaxHighlightCoordinator};
 use crate::view::build_unified_lines_with_overlay;
+use crate::watch::EventBatch;
+use crate::watch::runtime::{WatchCoordinator, WatchUpdate};
 use crate::worker::LineDiffCoordinator;
 
 // The layout reserves two title rows and one footer row. Scrolling and
@@ -156,6 +158,11 @@ pub struct App {
     worker: LineDiffCoordinator,
     structural_worker: StructuralDiffCoordinator,
     syntax_worker: SyntaxHighlightCoordinator,
+    /// Live only in worktree view; `None` for `tsuiku show` (the comparison
+    /// is immutable) and after the watcher degrades.
+    watch: Option<WatchCoordinator>,
+    /// Set once when watching stops working; shown as a title indicator.
+    watch_notice: Option<String>,
     comparison_label: Option<String>,
     started_at: Instant,
     terminal_initialized_micros: Cell<Option<u64>>,
@@ -216,6 +223,9 @@ impl App {
             worker: LineDiffCoordinator::new(LINE_DIFF_CACHE_BYTES),
             structural_worker: StructuralDiffCoordinator::new(STRUCTURAL_DIFF_CACHE_BYTES),
             syntax_worker: SyntaxHighlightCoordinator::new(SYNTAX_CACHE_BYTES),
+            watch: matches!(requested_view, RequestedView::Worktree)
+                .then(|| WatchCoordinator::start(path.to_path_buf())),
+            watch_notice: None,
             comparison_label,
             started_at,
             terminal_initialized_micros: Cell::new(None),
@@ -265,6 +275,22 @@ impl App {
     /// caches keyed on `ContentId`. The selection follows its path when the
     /// new snapshot still contains it.
     pub fn apply_snapshot(&mut self, changes: Vec<FileChange>) {
+        self.apply_snapshot_with_carry(changes, None);
+    }
+
+    /// Like [`Self::apply_snapshot`], optionally transferring the currently
+    /// displayed content to the same path in the new snapshot.
+    ///
+    /// The transfer is deliberate state transfer based on watch-event scope,
+    /// not a cache lookup: worktree stamps are hints, never identity, so
+    /// only "no observed event could have touched this pair" justifies
+    /// skipping the re-read. With a transfer the content worker is not
+    /// started at all and the reading position is kept.
+    fn apply_snapshot_with_carry(
+        &mut self,
+        changes: Vec<FileChange>,
+        carried: Option<Arc<PreparedContent>>,
+    ) {
         let previous_path = self
             .files
             .get(self.selected)
@@ -279,14 +305,64 @@ impl App {
             })
             .collect();
         self.content_cache = WeightedLru::new(CONTENT_CACHE_BYTES);
-        self.selected = previous_path
-            .and_then(|path| {
-                self.files
-                    .iter()
-                    .position(|file| file.change.display_path() == &path)
-            })
-            .unwrap_or_else(|| self.selected.min(self.files.len().saturating_sub(1)));
-        self.request_selected();
+        let repositioned = previous_path.and_then(|path| {
+            self.files
+                .iter()
+                .position(|file| file.change.display_path() == &path)
+        });
+        self.selected =
+            repositioned.unwrap_or_else(|| self.selected.min(self.files.len().saturating_sub(1)));
+        match (carried, repositioned) {
+            // The selected path survived and nothing touched its content:
+            // reactivate the held pair under the new generation. Line,
+            // structural and syntax requests re-key by ContentPairId and hit
+            // their caches.
+            (Some(content), Some(_)) => {
+                let scroll = self.scroll;
+                self.current_content = None;
+                self.worker.reset();
+                self.structural_worker.reset();
+                self.syntax_worker.reset();
+                let weight = content.estimated_bytes();
+                self.content_cache
+                    .insert(self.selected, Arc::clone(&content), weight);
+                self.activate_content(content);
+                self.scroll = scroll;
+                self.prefetch_adjacent();
+            }
+            _ => self.request_selected(),
+        }
+    }
+
+    /// Apply one completed watch update.
+    fn handle_watch_update(&mut self, update: WatchUpdate) {
+        match update {
+            WatchUpdate::Refresh { changes, batch } => self.handle_watch_refresh(changes, batch),
+            WatchUpdate::Degraded { reason } => {
+                self.watch_notice = Some(reason);
+                self.watch = None;
+            }
+        }
+    }
+
+    /// A refreshed snapshot always replaces the file list; whether the
+    /// displayed content needs a re-read is decided per selection from the
+    /// event batch, conservatively (metadata, ignore-source, unknown and
+    /// lossy batches always re-read).
+    fn handle_watch_refresh(&mut self, changes: crate::change::ChangeSet, batch: EventBatch) {
+        let selection_untouched = self.files.get(self.selected).is_some_and(|file| {
+            !batch.affects_selection(file.change.old_path.as_ref(), file.change.new_path.as_ref())
+        });
+        let carried = if selection_untouched {
+            self.current_content.clone()
+        } else {
+            None
+        };
+        let scroll = self.scroll;
+        self.apply_snapshot_with_carry(changes.changes, carried);
+        // Keep the reading position where possible; the viewport build
+        // clamps an offset past the new row count.
+        self.scroll = scroll;
     }
 
     fn activate_content(&mut self, content: Arc<PreparedContent>) {
@@ -403,6 +479,14 @@ impl App {
         let mut dirty = self.worker.poll();
         dirty |= self.structural_worker.poll();
         dirty |= self.syntax_worker.poll();
+        loop {
+            let update = self.watch.as_ref().and_then(WatchCoordinator::poll);
+            let Some(update) = update else {
+                break;
+            };
+            dirty = true;
+            self.handle_watch_update(update);
+        }
         loop {
             let result = self
                 .resolver
@@ -683,7 +767,9 @@ impl App {
                         _ => None,
                     },
                 },
-                self.scroll,
+                // A scroll preserved across a watch refresh may exceed the
+                // new diff; clamp for display, keys clamp the stored value.
+                self.scroll.min(max_scroll_for_rows(rows.len(), height)),
                 height,
             ),
         }
@@ -736,12 +822,21 @@ impl App {
             Some(label) => format!(" tsuiku  {label}  "),
             None => " tsuiku  ".to_owned(),
         };
+        // The stop reason (inotify limits, a lost repository, …) is what the
+        // user needs in order to react; it comes from error strings that can
+        // embed file names, so it must be escaped before reaching the
+        // terminal. Overlong reasons are clipped by the terminal width.
+        let watch = match &self.watch_notice {
+            Some(reason) => format!("  watch: off ({})", terminal_safe_label(reason)),
+            None => String::new(),
+        };
         let visible_count = self.visible_file_count();
         if visible_count == 0 {
-            return format!("{prefix}no changes ");
+            // A start failure on a clean tree must stay visible too.
+            return format!("{prefix}no changes{watch} ");
         }
         let Some(file) = self.files.get(self.selected) else {
-            return format!("{prefix}no changes ");
+            return format!("{prefix}no changes{watch} ");
         };
         let ordinal = self
             .files
@@ -761,7 +856,7 @@ impl App {
             }
             AsyncState::Ready(overlay) => {
                 return format!(
-                    "{prefix}[{ordinal}/{visible_count}] {}  structural: {} {}/{} ",
+                    "{prefix}[{ordinal}/{visible_count}] {}  structural: {} {}/{}{watch} ",
                     file_label(&file.change),
                     terminal_safe_label(&overlay.language),
                     overlay.diagnostics.accepted,
@@ -779,7 +874,7 @@ impl App {
             AsyncState::Failed(_) => "  structural: failed",
         };
         format!(
-            "{prefix}[{ordinal}/{visible_count}] {}{structural} ",
+            "{prefix}[{ordinal}/{visible_count}] {}{structural}{watch} ",
             file_label(&file.change),
         )
     }
@@ -1163,6 +1258,8 @@ mod tests {
             worker: LineDiffCoordinator::new(1024 * 1024),
             structural_worker: StructuralDiffCoordinator::new(1024 * 1024),
             syntax_worker: SyntaxHighlightCoordinator::new(1024 * 1024),
+            watch: None,
+            watch_notice: None,
             comparison_label: None,
             started_at: Instant::now(),
             terminal_initialized_micros: Cell::new(None),
@@ -1693,6 +1790,142 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), 5));
         assert_eq!(app.scroll, app.max_scroll(5));
         assert_eq!(app.scroll, 56);
+    }
+
+    fn refresh(changes: Vec<FileChange>, batch: EventBatch) -> WatchUpdate {
+        WatchUpdate::Refresh {
+            changes: crate::change::ChangeSet {
+                target: DiffTarget::WorktreeVsHead,
+                changes,
+                warnings: Vec::new(),
+            },
+            batch,
+        }
+    }
+
+    fn batch_of(paths: &[&[u8]]) -> EventBatch {
+        EventBatch {
+            paths: paths.iter().map(|path| GitPath::from_bytes(path)).collect(),
+            ..EventBatch::default()
+        }
+    }
+
+    #[test]
+    fn unrelated_watch_refresh_carries_content_without_a_reload() {
+        let mut app = test_app_with_prefetch();
+        let content = prepared_text("old\n", "new\n");
+        app.activate_content(Arc::clone(&content));
+        app.scroll = 3;
+
+        app.handle_watch_update(refresh(
+            vec![change(b"a"), change(b"b"), change(b"c")],
+            batch_of(&[b"unrelated.txt"]),
+        ));
+
+        assert_eq!(app.snapshot, SnapshotId(2));
+        assert!(
+            app.current_content
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &content)),
+            "the displayed pair must be transferred, not reloaded"
+        );
+        assert_eq!(app.scroll, 3, "the reading position is kept");
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test()
+                .map(|(_, priority)| priority),
+            Some(LoadPriority::Prefetch),
+            "only the adjacent prefetch may start, never a selected reload"
+        );
+    }
+
+    #[test]
+    fn watch_refresh_touching_the_selected_path_reloads_it() {
+        let mut app = test_app_with_prefetch();
+        let content = prepared_text("old\n", "new\n");
+        app.activate_content(Arc::clone(&content));
+
+        app.handle_watch_update(refresh(
+            vec![change(b"a"), change(b"b"), change(b"c")],
+            batch_of(&[b"a"]),
+        ));
+
+        assert!(app.current_content.is_none());
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            Some((0, LoadPriority::Selected)),
+            "the selected pair must be re-read"
+        );
+    }
+
+    #[test]
+    fn lossy_watch_refresh_never_carries_content() {
+        let mut app = test_app_with_prefetch();
+        let content = prepared_text("old\n", "new\n");
+        app.activate_content(Arc::clone(&content));
+
+        let mut batch = batch_of(&[b"unrelated.txt"]);
+        batch.overflow = true;
+        app.handle_watch_update(refresh(
+            vec![change(b"a"), change(b"b"), change(b"c")],
+            batch,
+        ));
+
+        assert!(
+            app.current_content.is_none(),
+            "possible event loss voids the carry-over shortcut"
+        );
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            Some((0, LoadPriority::Selected))
+        );
+    }
+
+    #[test]
+    fn degraded_watch_sets_the_notice_and_stops_polling() {
+        let mut app = test_app();
+        app.handle_watch_update(WatchUpdate::Degraded {
+            reason: "inotify watch limit reached".to_owned(),
+        });
+        assert_eq!(
+            app.watch_notice.as_deref(),
+            Some("inotify watch limit reached")
+        );
+        assert!(app.watch.is_none());
+        assert!(
+            app.title()
+                .contains("watch: off (inotify watch limit reached)"),
+            "the stop reason must be displayed, not just the fact"
+        );
+    }
+
+    #[test]
+    fn degraded_watch_stays_visible_on_a_clean_tree() {
+        let mut app = test_app();
+        app.files.iter_mut().for_each(|file| file.no_op = true);
+        app.handle_watch_update(WatchUpdate::Degraded {
+            reason: "gone".to_owned(),
+        });
+        assert_eq!(app.title(), " tsuiku  no changes  watch: off (gone) ");
+    }
+
+    #[test]
+    fn degraded_watch_reason_cannot_inject_terminal_controls() {
+        let mut app = test_app();
+        app.handle_watch_update(WatchUpdate::Degraded {
+            reason: "bad\u{1b}[31mpath".to_owned(),
+        });
+        let title = app.title();
+        assert!(title.contains(r"bad\u{1b}[31mpath"));
+        assert!(!title.contains('\u{1b}'));
     }
 
     #[test]
