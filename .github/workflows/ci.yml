@@ -54,5 +54,6 @@ jobs:
             nix develop -c cargo run --release --example engine_bench
             nix develop -c cargo run --release --example view_bench
             nix develop -c cargo run --release --example difft_bench
+            nix develop -c cargo run --release --example highlight_bench
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
