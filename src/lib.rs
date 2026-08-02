@@ -21,4 +21,5 @@ pub mod syntax;
 pub mod syntax_worker;
 pub mod text;
 pub mod view;
+pub mod watch;
 pub mod worker;

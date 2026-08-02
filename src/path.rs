@@ -26,6 +26,19 @@ impl GitPath {
         }
     }
 
+    /// Whether `self` is a strict ancestor directory of `other`
+    /// ('/'-separated byte comparison; a path is not its own ancestor).
+    /// The empty path denotes the worktree root and is an ancestor of every
+    /// non-empty path.
+    pub fn is_ancestor_of(&self, other: &GitPath) -> bool {
+        if self.0.is_empty() {
+            return !other.0.is_empty();
+        }
+        other.0.len() > self.0.len() + 1
+            && other.0.starts_with(&self.0)
+            && other.0[self.0.len()] == b'/'
+    }
+
     /// Extension of the final component: bytes after the last '.', unless the
     /// dot is the first byte of the file name (dotfiles have no extension).
     pub fn extension(&self) -> Option<&[u8]> {
@@ -128,6 +141,24 @@ mod tests {
     fn no_dot_no_extension() {
         let p = GitPath::from_bytes(b"Makefile");
         assert_eq!(p.extension(), None);
+    }
+
+    #[test]
+    fn ancestor_requires_a_separator_boundary() {
+        let dir = GitPath::from_bytes(b"src");
+        assert!(dir.is_ancestor_of(&GitPath::from_bytes(b"src/app.rs")));
+        assert!(!dir.is_ancestor_of(&GitPath::from_bytes(b"src")));
+        assert!(!dir.is_ancestor_of(&GitPath::from_bytes(b"srcfile.rs")));
+        assert!(!GitPath::from_bytes(b"src/app.rs").is_ancestor_of(&dir));
+    }
+
+    #[test]
+    fn empty_path_is_the_root_ancestor_of_everything_but_itself() {
+        let root = GitPath::from_bytes(b"");
+        assert!(root.is_ancestor_of(&GitPath::from_bytes(b"a.rs")));
+        assert!(root.is_ancestor_of(&GitPath::from_bytes(b"dir/a.rs")));
+        assert!(!root.is_ancestor_of(&root));
+        assert!(!GitPath::from_bytes(b"a.rs").is_ancestor_of(&root));
     }
 
     #[test]
