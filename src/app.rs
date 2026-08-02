@@ -41,7 +41,7 @@ use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
 use crate::compose::RowOverlays;
 use crate::discover::{CommitRevision, GixDiscoverer};
-use crate::ids::ContentIdentity;
+use crate::ids::{ContentIdentity, SnapshotId};
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
 use crate::path::GitPath;
 use crate::resolve::{GixResolver, ResolveError};
@@ -144,6 +144,10 @@ enum RequestedView<'a> {
 /// so raw mode is also restored after errors and panics.
 pub struct App {
     files: Vec<FileModel>,
+    /// Generation of `files`. Bumped by every re-discover; background load
+    /// results from an older generation are rejected outright because their
+    /// file indices may point at different files now.
+    snapshot: SnapshotId,
     selected: usize,
     scroll: usize,
     resolver: Option<ContentLoadCoordinator>,
@@ -203,6 +207,7 @@ impl App {
             .collect();
         let mut app = Self {
             files,
+            snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
             resolver: Some(ContentLoadCoordinator::new(resolver)),
@@ -246,8 +251,42 @@ impl App {
             return;
         }
         if let Some(resolver) = &self.resolver {
-            resolver.request(self.selected, file.change.clone());
+            resolver.request(self.snapshot, self.selected, file.change.clone());
         }
+    }
+
+    /// Replace the discovery snapshot with a newer one.
+    ///
+    /// The generation is bumped *before* anything else so every in-flight
+    /// result of the old generation is already rejectable when the new file
+    /// list becomes visible. The content cache is dropped wholesale: its keys
+    /// are file indices, which are meaningless across generations, and
+    /// content-based reuse is already provided by the line/structural/syntax
+    /// caches keyed on `ContentId`. The selection follows its path when the
+    /// new snapshot still contains it.
+    pub fn apply_snapshot(&mut self, changes: Vec<FileChange>) {
+        let previous_path = self
+            .files
+            .get(self.selected)
+            .map(|file| file.change.display_path().clone());
+        self.snapshot = self.snapshot.next();
+        self.files = changes
+            .into_iter()
+            .map(|change| FileModel {
+                change,
+                no_op: false,
+                load_error: None,
+            })
+            .collect();
+        self.content_cache = WeightedLru::new(CONTENT_CACHE_BYTES);
+        self.selected = previous_path
+            .and_then(|path| {
+                self.files
+                    .iter()
+                    .position(|file| file.change.display_path() == &path)
+            })
+            .unwrap_or_else(|| self.selected.min(self.files.len().saturating_sub(1)));
+        self.request_selected();
     }
 
     fn activate_content(&mut self, content: Arc<PreparedContent>) {
@@ -294,6 +333,11 @@ impl App {
     }
 
     fn handle_load_result(&mut self, result: LoadResult) {
+        // A stale-generation result may describe a different file than the
+        // one now occupying its index; it must neither display nor cache.
+        if result.snapshot != self.snapshot {
+            return;
+        }
         let selected = result.file_id == self.selected;
         match result.result {
             Ok(content) if content.kind == PreparedKind::NoOp => {
@@ -349,7 +393,7 @@ impl App {
             return;
         };
         if let (Some(resolver), Some(file)) = (&self.resolver, self.files.get(file_id)) {
-            resolver.prefetch(file_id, file.change.clone());
+            resolver.prefetch(self.snapshot, file_id, file.change.clone());
         }
     }
 
@@ -1110,6 +1154,7 @@ mod tests {
                     load_error: None,
                 },
             ],
+            snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
             resolver: None,
@@ -1651,12 +1696,93 @@ mod tests {
     }
 
     #[test]
+    fn stale_generation_result_is_rejected_after_files_shift() {
+        // A file inserted at the head means index 0 now names a different
+        // file: the old generation's index-0 result must neither display
+        // nor enter the (index-keyed) content cache.
+        let mut app = test_app();
+        let shifted = vec![change(b"inserted-at-head"), change(b"a"), change(b"b")];
+        app.apply_snapshot(shifted);
+        assert_eq!(app.snapshot, SnapshotId(2));
+        assert_eq!(app.selected, 1, "the selection follows its path");
+
+        app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+
+        assert!(!app.content_cache.contains_key(&0));
+        assert!(app.current_content.is_none());
+    }
+
+    #[test]
+    fn deleting_the_selected_file_moves_the_selection_to_a_valid_entry() {
+        let mut app = test_app();
+        assert_eq!(app.files[0].change.display_path().as_bytes(), b"a");
+
+        app.apply_snapshot(vec![change(b"b")]);
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.files[app.selected].change.display_path().as_bytes(),
+            b"b"
+        );
+        assert!(app.current_content.is_none());
+    }
+
+    #[test]
+    fn stale_selected_result_arriving_after_the_switch_stays_pending() {
+        // The same path stays selected across the switch, but the old
+        // generation's bytes may be outdated: the display must stay in the
+        // loading state until the new generation's result arrives.
+        let mut app = test_app();
+        app.apply_snapshot(vec![change(b"a"), change(b"b")]);
+        assert_eq!(app.selected, 0);
+
+        app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+
+        assert!(app.current_content.is_none());
+        assert!(!app.content_cache.contains_key(&0));
+        assert_eq!(app.body_lines(10)[0].spans[0].content, "Loading content…");
+
+        // The current generation's result still applies normally.
+        app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(2),
+            file_id: 0,
+            result: Ok(prepared_value(PreparedKind::Binary)),
+        });
+        assert!(app.current_content.is_some());
+    }
+
+    #[test]
+    fn snapshot_switch_drops_the_content_cache_and_follows_the_selected_path() {
+        let mut app = test_app();
+        app.selected = 1;
+        app.content_cache
+            .insert(0, prepared(PreparedKind::Binary), 64);
+
+        app.apply_snapshot(vec![change(b"b"), change(b"a")]);
+
+        assert_eq!(app.selected, 0, "path b moved to the head");
+        assert!(
+            !app.content_cache.contains_key(&0),
+            "index-keyed entries are meaningless across generations"
+        );
+    }
+
+    #[test]
     fn unselected_load_result_is_cached_without_replacing_visible_content() {
         let mut app = test_app();
         let selected = prepared(PreparedKind::Binary);
         app.activate_content(Arc::clone(&selected));
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 1,
             result: Ok(prepared_value(PreparedKind::Binary)),
         });
@@ -1676,6 +1802,7 @@ mod tests {
         app.activate_content(Arc::clone(&selected));
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 1,
             result: Ok(prepared_value(PreparedKind::NoOp)),
         });
@@ -1694,6 +1821,7 @@ mod tests {
         let mut app = test_app_with_prefetch();
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 0,
             result: Ok(prepared_value(PreparedKind::Binary)),
         });
@@ -1711,6 +1839,7 @@ mod tests {
     fn completed_prefetch_does_not_chain_past_visible_content() {
         let mut app = test_app_with_prefetch();
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 0,
             result: Ok(prepared_value(PreparedKind::Binary)),
         });
@@ -1723,6 +1852,7 @@ mod tests {
         );
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 1,
             result: Ok(prepared_value(PreparedKind::Binary)),
         });
@@ -1740,6 +1870,7 @@ mod tests {
     fn no_op_prefetch_chains_to_the_next_visible_neighbor() {
         let mut app = test_app_with_prefetch();
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 0,
             result: Ok(prepared_value(PreparedKind::Binary)),
         });
@@ -1752,6 +1883,7 @@ mod tests {
         );
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 1,
             result: Ok(prepared_value(PreparedKind::NoOp)),
         });
@@ -1771,6 +1903,7 @@ mod tests {
         let mut app = test_app();
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 0,
             result: Ok(prepared_value(PreparedKind::NoOp)),
         });
@@ -1785,6 +1918,7 @@ mod tests {
         app.selected = 1;
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 1,
             result: Ok(prepared_value(PreparedKind::NoOp)),
         });
@@ -1798,6 +1932,7 @@ mod tests {
         let mut app = test_app();
 
         app.handle_load_result(LoadResult {
+            snapshot: SnapshotId(1),
             file_id: 0,
             result: Err(load_error("a", "gone")),
         });

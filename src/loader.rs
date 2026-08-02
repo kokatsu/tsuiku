@@ -9,14 +9,15 @@
 //! One job may be running and one newer job may be queued. A new selection
 //! replaces the queued job, while a prefetch never displaces queued selected
 //! work. Rapid navigation therefore does not build an unbounded backlog.
-//! Completed results carry `file_id`, the stable index of the corresponding
-//! discovery result.
+//! Completed results carry the snapshot generation and `file_id` they were
+//! requested under; a file index is only meaningful within its snapshot, so
+//! the owner applies a result only when both match its current state.
 
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use crate::change::FileChange;
-use crate::ids::{ContentPairId, ResolvedContent};
+use crate::ids::{ContentPairId, ResolvedContent, SnapshotId};
 use crate::resolve::{ContentResolver, GixResolver, ResolveError, ResolvedChange};
 use crate::text::{ClassifiedContent, TextContent, classify};
 
@@ -60,8 +61,15 @@ impl PreparedContent {
 
 #[derive(Clone)]
 struct LoadJob {
+    snapshot: SnapshotId,
     file_id: usize,
     change: FileChange,
+}
+
+impl LoadJob {
+    fn identity(&self) -> (SnapshotId, usize) {
+        (self.snapshot, self.file_id)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,13 +85,13 @@ struct QueuedLoad {
 
 struct Slot {
     queued: Option<QueuedLoad>,
-    running: Option<usize>,
+    running: Option<(SnapshotId, usize)>,
     stopped: bool,
 }
 
 impl Slot {
     fn enqueue(&mut self, job: LoadJob, priority: LoadPriority) -> bool {
-        if self.running == Some(job.file_id) {
+        if self.running == Some(job.identity()) {
             // If the user navigates A -> B -> A while A is still loading, B is
             // no longer useful and must not start after A finishes.
             if priority == LoadPriority::Selected {
@@ -93,7 +101,7 @@ impl Slot {
         }
 
         if let Some(queued) = &mut self.queued
-            && queued.job.file_id == job.file_id
+            && queued.job.identity() == job.identity()
         {
             // Selecting a queued prefetch promotes it so another prefetch
             // cannot replace the now user-visible request.
@@ -119,7 +127,9 @@ impl Slot {
 
 /// Result returned by the loading thread.
 pub struct LoadResult {
-    /// Stable index into the discovery snapshot supplied to `request`.
+    /// Generation of the snapshot the request belonged to.
+    pub snapshot: SnapshotId,
+    /// Index into that snapshot's file list.
     pub file_id: usize,
     /// Loaded content or the repository-resolution error.
     pub result: Result<PreparedContent, ResolveError>,
@@ -156,14 +166,21 @@ impl ContentLoadCoordinator {
         }
     }
 
-    /// Requests loading for `file_id`.
+    /// Requests loading for `file_id` in the given snapshot generation.
     ///
     /// Returns `false` when that file is already running or queued. Otherwise,
     /// any older queued request is replaced by this one.
-    pub fn request(&self, file_id: usize, change: FileChange) -> bool {
+    pub fn request(&self, snapshot: SnapshotId, file_id: usize, change: FileChange) -> bool {
         let (lock, wake) = &*self.slot;
         let mut slot = lock.lock().expect("content queue lock poisoned");
-        let queued = slot.enqueue(LoadJob { file_id, change }, LoadPriority::Selected);
+        let queued = slot.enqueue(
+            LoadJob {
+                snapshot,
+                file_id,
+                change,
+            },
+            LoadPriority::Selected,
+        );
         if queued {
             wake.notify_one();
         }
@@ -177,10 +194,17 @@ impl ContentLoadCoordinator {
     /// when a selected request already owns the queue. Resolution itself is
     /// not cancellable: if a prefetch is already running, a later selected
     /// request waits behind that one read.
-    pub fn prefetch(&self, file_id: usize, change: FileChange) -> bool {
+    pub fn prefetch(&self, snapshot: SnapshotId, file_id: usize, change: FileChange) -> bool {
         let (lock, wake) = &*self.slot;
         let mut slot = lock.lock().expect("content queue lock poisoned");
-        let queued = slot.enqueue(LoadJob { file_id, change }, LoadPriority::Prefetch);
+        let queued = slot.enqueue(
+            LoadJob {
+                snapshot,
+                file_id,
+                change,
+            },
+            LoadPriority::Prefetch,
+        );
         if queued {
             wake.notify_one();
         }
@@ -257,18 +281,20 @@ fn worker_loop(
                 return;
             }
             let job = state.queued.take().expect("checked above").job;
-            state.running = Some(job.file_id);
+            state.running = Some(job.identity());
             job
         };
 
+        let identity = job.identity();
         let result = prepare(&resolver, job.change);
         let _ = tx.send(LoadResult {
-            file_id: job.file_id,
+            snapshot: identity.0,
+            file_id: identity.1,
             result,
         });
         let (lock, _) = &*slot;
         if let Ok(mut state) = lock.lock()
-            && state.running == Some(job.file_id)
+            && state.running == Some(identity)
         {
             state.running = None;
         }
@@ -322,7 +348,12 @@ mod tests {
     use crate::ids::ContentSource;
 
     fn job(file_id: usize) -> LoadJob {
+        job_in(SnapshotId(1), file_id)
+    }
+
+    fn job_in(snapshot: SnapshotId, file_id: usize) -> LoadJob {
         LoadJob {
+            snapshot,
             file_id,
             change: FileChange::classify(
                 None,
@@ -361,7 +392,7 @@ mod tests {
                 job: job(2),
                 priority: LoadPriority::Selected,
             }),
-            running: Some(1),
+            running: Some((SnapshotId(1), 1)),
             stopped: false,
         };
         assert!(!slot.enqueue(job(1), LoadPriority::Selected));
@@ -375,7 +406,7 @@ mod tests {
                 job: job(2),
                 priority: LoadPriority::Prefetch,
             }),
-            running: Some(1),
+            running: Some((SnapshotId(1), 1)),
             stopped: false,
         };
 
@@ -392,7 +423,7 @@ mod tests {
                 job: job(2),
                 priority: LoadPriority::Prefetch,
             }),
-            running: Some(1),
+            running: Some((SnapshotId(1), 1)),
             stopped: false,
         };
 
@@ -409,7 +440,7 @@ mod tests {
                 job: job(2),
                 priority: LoadPriority::Selected,
             }),
-            running: Some(1),
+            running: Some((SnapshotId(1), 1)),
             stopped: false,
         };
 
@@ -426,7 +457,7 @@ mod tests {
                 job: job(2),
                 priority: LoadPriority::Prefetch,
             }),
-            running: Some(1),
+            running: Some((SnapshotId(1), 1)),
             stopped: false,
         };
 

@@ -11,6 +11,21 @@ use std::time::SystemTime;
 
 use crate::path::GitPath;
 
+/// Monotonic generation of one discovery snapshot.
+///
+/// File indices are only meaningful within one snapshot: a re-discover may
+/// insert, remove, or reorder entries. Background results therefore carry the
+/// generation they were requested under, and a result applies only when both
+/// its generation and its file index match the current snapshot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SnapshotId(pub u64);
+
+impl SnapshotId {
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// Pure content hash: blake3 over the full raw bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ContentId(blake3::Hash);
