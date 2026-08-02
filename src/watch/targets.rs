@@ -353,6 +353,19 @@ fn canonical_lenient(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+impl WatchTargets {
+    /// A minimal fixture for tests outside this module: a worktree root, a
+    /// git root treated as internal, and no named targets.
+    pub(crate) fn stub(worktree_root: PathBuf, git_root: PathBuf) -> Self {
+        Self {
+            worktree_root,
+            git_roots: vec![git_root],
+            named: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

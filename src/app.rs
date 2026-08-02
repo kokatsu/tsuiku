@@ -71,6 +71,10 @@ const SIDEBAR_MIN_BODY_WIDTH: u16 = 72;
 // Metrics are diagnostic and may run for a long session. Bound sample storage
 // independently of the number of input events.
 const MAX_METRIC_SAMPLES: usize = 100_000;
+// How long after an unstable read the single retry fires — one debounce
+// period of breathing room, so an active writer costs one small read per
+// period, never a busy loop.
+const UNSTABLE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Failure returned while starting or running the terminal application.
 #[derive(Debug)]
@@ -99,6 +103,15 @@ impl From<io::Error> for AppError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+/// One scheduled re-read of a pair whose worktree side kept changing while
+/// being read. The identity is re-checked when the retry fires: a bumped
+/// generation or a moved selection silently voids it.
+struct UnstableRetry {
+    snapshot: SnapshotId,
+    file_id: usize,
+    at: Instant,
 }
 
 struct FileModel {
@@ -163,6 +176,11 @@ pub struct App {
     watch: Option<WatchCoordinator>,
     /// Set once when watching stops working; shown as a title indicator.
     watch_notice: Option<String>,
+    /// At most one pending re-read after an unstable worktree read; the
+    /// explicit re-injection the stat–read–stat contract requires (a watch
+    /// event from the interfering writer is not guaranteed — the watcher
+    /// may be degraded, or the write may never produce an event).
+    unstable_retry: Option<UnstableRetry>,
     comparison_label: Option<String>,
     started_at: Instant,
     terminal_initialized_micros: Cell<Option<u64>>,
@@ -226,6 +244,7 @@ impl App {
             watch: matches!(requested_view, RequestedView::Worktree)
                 .then(|| WatchCoordinator::start(path.to_path_buf())),
             watch_notice: None,
+            unstable_retry: None,
             comparison_label,
             started_at,
             terminal_initialized_micros: Cell::new(None),
@@ -243,6 +262,7 @@ impl App {
     fn request_selected(&mut self) {
         // State from the previous selection must stop being visible
         // immediately, even if its background work later completes.
+        self.unstable_retry = None;
         self.scroll = 0;
         self.current_content = None;
         self.worker.reset();
@@ -291,6 +311,9 @@ impl App {
         changes: Vec<FileChange>,
         carried: Option<Arc<PreparedContent>>,
     ) {
+        // Any pending retry belongs to the outgoing generation; the reload
+        // branch re-requests anyway and the carry branch has good content.
+        self.unstable_retry = None;
         let previous_path = self
             .files
             .get(self.selected)
@@ -331,6 +354,33 @@ impl App {
                 self.prefetch_adjacent();
             }
             _ => self.request_selected(),
+        }
+    }
+
+    /// Fire the scheduled re-read after an unstable worktree read, once
+    /// its delay elapsed and only when generation and selection still
+    /// match. Each failure schedules exactly one successor, so a file
+    /// under continuous writing costs one probing read per delay period.
+    fn retry_unstable_read_if_due(&mut self) {
+        if self
+            .unstable_retry
+            .as_ref()
+            .is_none_or(|retry| retry.at > Instant::now())
+        {
+            return;
+        }
+        let retry = self.unstable_retry.take().expect("checked above");
+        if retry.snapshot != self.snapshot || retry.file_id != self.selected {
+            return;
+        }
+        let Some(file) = self.files.get(retry.file_id) else {
+            return;
+        };
+        if file.no_op {
+            return;
+        }
+        if let Some(resolver) = &self.resolver {
+            resolver.request(self.snapshot, retry.file_id, file.change.clone());
         }
     }
 
@@ -451,6 +501,21 @@ impl App {
                     self.prefetch_adjacent();
                 }
             }
+            // A concurrent writer kept the file inconsistent during the
+            // read. This is transient, not a failure: the display stays in
+            // its loading state and one delayed retry is scheduled — an
+            // event from the interfering writer is not guaranteed to arrive,
+            // so the re-read must not depend on the watcher.
+            Err(ResolveError::UnstableRead { .. }) => {
+                if selected {
+                    self.unstable_retry = Some(UnstableRetry {
+                        snapshot: result.snapshot,
+                        file_id: result.file_id,
+                        at: Instant::now() + UNSTABLE_RETRY_DELAY,
+                    });
+                    self.prefetch_adjacent();
+                }
+            }
             Err(error) => {
                 if let Some(file) = self.files.get_mut(result.file_id) {
                     file.load_error = Some(error);
@@ -487,6 +552,7 @@ impl App {
             dirty = true;
             self.handle_watch_update(update);
         }
+        self.retry_unstable_read_if_due();
         loop {
             let result = self
                 .resolver
@@ -1260,6 +1326,7 @@ mod tests {
             syntax_worker: SyntaxHighlightCoordinator::new(1024 * 1024),
             watch: None,
             watch_notice: None,
+            unstable_retry: None,
             comparison_label: None,
             started_at: Instant::now(),
             terminal_initialized_micros: Cell::new(None),
@@ -2158,6 +2225,114 @@ mod tests {
 
         assert!(app.files[1].no_op);
         assert_eq!(app.selected, 0);
+    }
+
+    fn unstable_result(file_id: usize) -> LoadResult {
+        LoadResult {
+            snapshot: SnapshotId(1),
+            file_id,
+            result: Err(ResolveError::UnstableRead {
+                path: "a".to_owned(),
+            }),
+        }
+    }
+
+    /// Make the pending retry immediately due.
+    fn force_retry_due(app: &mut App) {
+        let retry = app.unstable_retry.as_mut().expect("retry scheduled");
+        retry.at = Instant::now();
+    }
+
+    #[test]
+    fn unstable_read_keeps_the_loading_state_instead_of_an_error() {
+        let mut app = test_app();
+
+        app.handle_load_result(unstable_result(0));
+
+        assert!(app.files[0].load_error.is_none());
+        assert_eq!(app.body_lines(10)[0].spans[0].content, "Loading content…");
+    }
+
+    #[test]
+    fn unstable_read_reinjects_the_selected_pair_after_the_delay() {
+        let mut app = test_app_with_prefetch();
+        app.resolver
+            .as_ref()
+            .expect("test coordinator")
+            .take_queued_for_test();
+
+        app.handle_load_result(unstable_result(0));
+        app.retry_unstable_read_if_due();
+        assert_ne!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test()
+                .map(|(_, priority)| priority),
+            Some(LoadPriority::Selected),
+            "the retry must wait out its delay"
+        );
+
+        force_retry_due(&mut app);
+        app.retry_unstable_read_if_due();
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            Some((0, LoadPriority::Selected)),
+            "an event from the writer is not guaranteed; the retry is"
+        );
+        assert!(
+            app.unstable_retry.is_none(),
+            "exactly one retry per failure"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_deselected_retry_never_fires() {
+        // Generation moved on: the retry is silently voided.
+        let mut app = test_app_with_prefetch();
+        app.handle_load_result(unstable_result(0));
+        app.snapshot = app.snapshot.next();
+        app.resolver
+            .as_ref()
+            .expect("test coordinator")
+            .take_queued_for_test();
+        force_retry_due(&mut app);
+        app.retry_unstable_read_if_due();
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            None
+        );
+
+        // Selection moved on: same outcome.
+        let mut app = test_app_with_prefetch();
+        app.handle_load_result(unstable_result(0));
+        app.selected = 1;
+        app.resolver
+            .as_ref()
+            .expect("test coordinator")
+            .take_queued_for_test();
+        force_retry_due(&mut app);
+        app.retry_unstable_read_if_due();
+        assert_eq!(
+            app.resolver
+                .as_ref()
+                .expect("test coordinator")
+                .queued_for_test(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unstable_prefetch_schedules_no_retry() {
+        let mut app = test_app_with_prefetch();
+        app.handle_load_result(unstable_result(1));
+        assert!(app.unstable_retry.is_none());
     }
 
     #[test]

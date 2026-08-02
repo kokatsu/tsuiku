@@ -47,11 +47,21 @@ pub enum WatchUpdate {
     Degraded { reason: String },
 }
 
+/// Out-of-band instructions from the owning thread to the worker. Kept off
+/// the raw event channel on purpose: that channel's senders must live only
+/// inside the backend watcher, so a dead backend still disconnects it and
+/// surfaces as [`WatchUpdate::Degraded`] instead of silent staleness.
+enum Control {
+    /// Behave as if the backend reported possible event loss.
+    InjectRescan,
+}
+
 /// Handle owned by the terminal thread.
 pub struct WatchCoordinator {
     updates: mpsc::Receiver<WatchUpdate>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    control: mpsc::Sender<Control>,
 }
 
 impl WatchCoordinator {
@@ -62,10 +72,11 @@ impl WatchCoordinator {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (tx, updates) = mpsc::channel();
+        let (control, control_rx) = mpsc::channel::<Control>();
         let thread = thread::Builder::new()
             .name("tsuiku-watch".into())
             .spawn(move || {
-                if let Err(reason) = worker(&path, &tx, &worker_stop) {
+                if let Err(reason) = worker(&path, &tx, &worker_stop, &control_rx) {
                     let _ = tx.send(WatchUpdate::Degraded { reason });
                 }
             })
@@ -74,12 +85,22 @@ impl WatchCoordinator {
             updates,
             stop,
             thread: Some(thread),
+            control,
         }
     }
 
     /// One completed update, without waiting.
     pub fn poll(&self) -> Option<WatchUpdate> {
         self.updates.try_recv().ok()
+    }
+
+    /// Test hook: make the worker behave as if the backend had reported
+    /// possible event loss, exercising the full recovery pipeline — lossy
+    /// batch, re-arm, rediscovery, lossy refresh. Latency is bounded by the
+    /// worker's idle tick.
+    #[doc(hidden)]
+    pub fn inject_rescan_for_test(&self) {
+        let _ = self.control.send(Control::InjectRescan);
     }
 }
 
@@ -218,12 +239,20 @@ fn is_missing_path(error: &notify::Error) -> bool {
     }
 }
 
-fn worker(path: &Path, tx: &mpsc::Sender<WatchUpdate>, stop: &AtomicBool) -> Result<(), String> {
+fn worker(
+    path: &Path,
+    tx: &mpsc::Sender<WatchUpdate>,
+    stop: &AtomicBool,
+    control: &mpsc::Receiver<Control>,
+) -> Result<(), String> {
     let mut discoverer =
         GixDiscoverer::open(path).map_err(|error| format!("cannot open repository: {error}"))?;
     let targets = WatchTargets::resolve(discoverer.repository())
         .map_err(|error| format!("cannot resolve watch targets: {error}"))?;
 
+    // The only senders of this channel live inside the watcher: a backend
+    // that stops delivering disconnects it, which the loop below turns
+    // into an explicit degradation instead of silent staleness.
     let (event_tx, events) = mpsc::channel::<RawEvent>();
     let watcher = notify::recommended_watcher(move |event: RawEvent| {
         let _ = event_tx.send(event);
@@ -294,6 +323,10 @@ fn worker(path: &Path, tx: &mpsc::Sender<WatchUpdate>, stop: &AtomicBool) -> Res
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("filesystem watcher stopped delivering events".into());
             }
+        }
+        while let Ok(Control::InjectRescan) = control.try_recv() {
+            filter_dirty = true;
+            debouncer.observe(WatchEvent::Overflow, Instant::now());
         }
 
         let Some(batch) = debouncer.due(Instant::now()) else {
@@ -394,6 +427,69 @@ mod tests {
         assert_eq!(
             nearest_existing_ancestor(Path::new("/nonexistent-tsuiku-test/x/y")),
             Path::new("/")
+        );
+    }
+
+    /// A state whose watcher watches nothing; classification is pure.
+    fn state_for_test() -> WatchState {
+        WatchState {
+            watcher: notify::recommended_watcher(|_| {}).expect("create watcher"),
+            targets: WatchTargets::stub(PathBuf::from("/work"), PathBuf::from("/work/.git")),
+            watched_dirs: vec![PathBuf::from("/work"), PathBuf::from("/work/.git")],
+            pending_dirs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn injected_backend_errors_and_rescans_classify_as_overflow() {
+        let state = state_for_test();
+        assert_eq!(
+            classify_raw(Err(notify::Error::generic("boom")), &state),
+            vec![WatchEvent::Overflow],
+            "a backend error may mean lost events"
+        );
+        let rescan = notify::Event::new(EventKind::Any).set_flag(notify::event::Flag::Rescan);
+        assert_eq!(
+            classify_raw(Ok(rescan), &state),
+            vec![WatchEvent::Overflow],
+            "an explicit rescan request enters full recovery"
+        );
+    }
+
+    #[test]
+    fn removing_a_watched_directory_classifies_as_overflow() {
+        let state = state_for_test();
+        let removal = notify::Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+            .add_path(PathBuf::from("/work/.git"));
+        assert_eq!(
+            classify_raw(Ok(removal), &state),
+            vec![WatchEvent::Overflow]
+        );
+    }
+
+    #[test]
+    fn read_side_access_events_are_discarded_before_classification() {
+        let state = state_for_test();
+        let open = notify::Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(PathBuf::from("/work/file.rs"));
+        assert!(classify_raw(Ok(open), &state).is_empty());
+
+        let close_read = notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(PathBuf::from("/work/.git/index"));
+        assert!(
+            classify_raw(Ok(close_read), &state).is_empty(),
+            "rediscovery reading .git/index must not feed itself"
+        );
+
+        let close_write =
+            notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                .add_path(PathBuf::from("/work/file.rs"));
+        assert_eq!(
+            classify_raw(Ok(close_write), &state),
+            vec![WatchEvent::Worktree {
+                path: crate::path::GitPath::from_bytes(b"file.rs")
+            }],
+            "the write-completion access still carries information"
         );
     }
 }
