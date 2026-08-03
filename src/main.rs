@@ -128,10 +128,8 @@ fn parse_range(range: &OsString) -> Option<Command> {
     let bytes = range.as_os_str().as_bytes();
     let (separator, merge_base) = if let Some(at) = find(bytes, b"...") {
         (at, true)
-    } else if let Some(at) = find(bytes, b"..") {
-        (at, false)
     } else {
-        return None;
+        (find(bytes, b"..")?, false)
     };
     let base = &bytes[..separator];
     let head = &bytes[separator + if merge_base { 3 } else { 2 }..];
