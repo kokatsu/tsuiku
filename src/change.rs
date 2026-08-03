@@ -18,6 +18,9 @@ pub enum DiffTarget {
     /// A commit against its first parent. Merges are compared against parent
     /// one only; this is not git's combined diff.
     CommitVsParent { commit: Oid },
+    /// The tree of `base` against the tree of `head`. A three-dot comparison
+    /// (as GitHub shows for a pull request) passes the merge base as `base`.
+    CommitVsCommit { base: Oid, head: Oid },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -136,8 +139,10 @@ pub enum DiscoverError {
     OpenRepository(Box<dyn std::error::Error + Send + Sync>),
     /// `WorktreeVsHead` was asked for in a bare repository.
     NoWorktree,
-    /// The revision named by `CommitVsParent` does not exist.
+    /// A commit named by the target does not exist.
     NoSuchCommit { commit: Oid },
+    /// The two commits of `CommitVsCommit` share no ancestor.
+    NoMergeBase { base: Oid, head: Oid },
     /// A revision expression did not resolve to a commit.
     InvalidRevision { revision: String },
     /// Reading refs, the index, or the object database failed.
@@ -150,6 +155,12 @@ impl std::fmt::Display for DiscoverError {
             Self::OpenRepository(e) => write!(f, "cannot open repository: {e}"),
             Self::NoWorktree => write!(f, "repository has no worktree"),
             Self::NoSuchCommit { commit } => write!(f, "no such commit: {}", commit.to_hex()),
+            Self::NoMergeBase { base, head } => write!(
+                f,
+                "no common ancestor between {} and {}",
+                base.to_hex(),
+                head.to_hex()
+            ),
             Self::InvalidRevision { revision } => {
                 write!(f, "revision does not name a commit: {revision}")
             }

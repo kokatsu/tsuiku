@@ -16,8 +16,8 @@
 #   symlinks-off/ — core.symlinks is off, so links are plain files on disk
 #
 # main/ carries tags (fixture-root, fixture-annotated-root, fixture-merge,
-# fixture-gitlink, fixture-rename) so tests name commits instead of counting
-# back from HEAD.
+# fixture-gitlink, fixture-rename, fixture-orphan) so tests name commits
+# instead of counting back from HEAD.
 #
 # The global git config is neutralised so the fixtures do not inherit the
 # developer's settings (autocrlf, diff.external, and friends).
@@ -136,6 +136,14 @@ git commit --quiet -m 'add staged_delete.txt'
 git mv committed_rename_src.txt committed_rename_dst.txt
 git commit --quiet -m 'rename committed_rename_src.txt'
 git tag fixture-rename
+
+# --- an orphan commit sharing no history with main, for merge-base --------
+# Built with plumbing so neither the index nor the worktree is touched
+# (a checkout would materialise the gitlink above as an empty directory).
+orphan_blob=$(printf 'orphan\n' | git hash-object -w --stdin)
+orphan_tree=$(printf '100644 blob %s\torphan.txt\n' "$orphan_blob" | git mktree)
+orphan_commit=$(git commit-tree "$orphan_tree" -m 'orphan commit')
+git tag fixture-orphan "$orphan_commit"
 
 head_commit=$(git rev-parse HEAD)
 

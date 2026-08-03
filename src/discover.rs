@@ -114,6 +114,9 @@ impl ChangeDiscoverer for GixDiscoverer {
             DiffTarget::CommitVsParent { commit } => {
                 self.commit_vs_parent(commit, &query.pathspecs)
             }
+            DiffTarget::CommitVsCommit { base, head } => {
+                self.commit_vs_commit(base, head, &query.pathspecs)
+            }
         }
     }
 }
@@ -459,12 +462,9 @@ impl GixDiscoverer {
         commit: Oid,
         pathspecs: &[GitPath],
     ) -> Result<ChangeSet, DiscoverError> {
-        use gix::diff::tree_with_rewrites::Change as C;
-
-        let id = gix::ObjectId::Sha1(commit.0);
         let object = self
             .repo
-            .find_commit(id)
+            .find_commit(gix::ObjectId::Sha1(commit.0))
             .map_err(|_| DiscoverError::NoSuchCommit { commit })?;
         let new_tree = object.tree().map_err(repo_err)?;
 
@@ -481,9 +481,70 @@ impl GixDiscoverer {
             None => None,
         };
 
+        self.diff_trees(
+            old_tree.as_ref(),
+            &new_tree,
+            DiffTarget::CommitVsParent { commit },
+            pathspecs,
+        )
+    }
+
+    fn commit_vs_commit(
+        &self,
+        base: Oid,
+        head: Oid,
+        pathspecs: &[GitPath],
+    ) -> Result<ChangeSet, DiscoverError> {
+        let tree_of = |commit: Oid| -> Result<gix::Tree<'_>, DiscoverError> {
+            self.repo
+                .find_commit(gix::ObjectId::Sha1(commit.0))
+                .map_err(|_| DiscoverError::NoSuchCommit { commit })?
+                .tree()
+                .map_err(repo_err)
+        };
+        let old_tree = tree_of(base)?;
+        let new_tree = tree_of(head)?;
+        self.diff_trees(
+            Some(&old_tree),
+            &new_tree,
+            DiffTarget::CommitVsCommit { base, head },
+            pathspecs,
+        )
+    }
+
+    /// The merge base of two commits, for three-dot comparisons.
+    pub fn merge_base(&self, base: Oid, head: Oid) -> Result<Oid, DiscoverError> {
+        use gix::repository::merge_base::Error as E;
+        let id = self
+            .repo
+            .merge_base(gix::ObjectId::Sha1(base.0), gix::ObjectId::Sha1(head.0))
+            .map_err(|e| match e {
+                E::NotFound { .. } => DiscoverError::NoMergeBase { base, head },
+                other => repo_err(other),
+            })?;
+        Ok(oid_from_gix(&id))
+    }
+
+    /// Whether the commit exists in the local object database. Used to decide
+    /// whether a fetch is needed before a commit comparison.
+    pub fn contains_commit(&self, commit: Oid) -> bool {
+        self.repo.find_commit(gix::ObjectId::Sha1(commit.0)).is_ok()
+    }
+
+    /// Diff two trees into a `ChangeSet`; the shared body of the commit
+    /// comparisons. `target` is recorded verbatim in the result.
+    fn diff_trees(
+        &self,
+        old_tree: Option<&gix::Tree<'_>>,
+        new_tree: &gix::Tree<'_>,
+        target: DiffTarget,
+        pathspecs: &[GitPath],
+    ) -> Result<ChangeSet, DiscoverError> {
+        use gix::diff::tree_with_rewrites::Change as C;
+
         let raw = self
             .repo
-            .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
+            .diff_tree_to_tree(old_tree, Some(new_tree), None)
             .map_err(repo_err)?;
 
         let mut matcher = self.pathspec_matcher(pathspecs)?;
@@ -582,7 +643,7 @@ impl GixDiscoverer {
 
         changes.sort_by(|a, b| a.display_path().as_bytes().cmp(b.display_path().as_bytes()));
         Ok(ChangeSet {
-            target: DiffTarget::CommitVsParent { commit },
+            target,
             changes,
             warnings: Vec::new(),
         })

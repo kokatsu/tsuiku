@@ -19,6 +19,7 @@ const ANNOTATED_ROOT: &str = "fixture-annotated-root";
 const MERGE: &str = "fixture-merge";
 const GITLINK: &str = "fixture-gitlink";
 const RENAME: &str = "fixture-rename";
+const ORPHAN: &str = "fixture-orphan";
 
 fn discover_rev(rev: &str) -> ChangeSet {
     let repo = shared().repo("main");
@@ -271,4 +272,198 @@ fn a_pathspec_matching_only_the_rename_destination_is_an_addition() {
     let set = rename_under_pathspec(b"committed_rename_dst.txt");
     assert_eq!(paths(&set), vec!["committed_rename_dst.txt".to_string()]);
     assert_eq!(set.changes[0].status, ChangeStatus::Add);
+}
+
+// --- CommitVsCommit -------------------------------------------------------
+
+fn discover_pair(base: &str, head: &str) -> ChangeSet {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    discoverer
+        .discover(&ChangeQuery::new(DiffTarget::CommitVsCommit {
+            base: rev_parse(&repo, base),
+            head: rev_parse(&repo, head),
+        }))
+        .expect("discover")
+}
+
+/// `git diff --name-status base head` as the oracle, one "X\tpath" line per
+/// change (rename lines are "RNNN\told\tnew").
+fn git_name_status(repo: &std::path::Path, base: &str, head: &str) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(repo)
+        .args(["diff", "--name-status", base, head])
+        .output()
+        .expect("run git diff");
+    assert!(output.status.success(), "git diff failed");
+    String::from_utf8(output.stdout)
+        .expect("utf-8 fixture paths")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn name_status(set: &ChangeSet) -> Vec<String> {
+    set.changes
+        .iter()
+        .map(|c| {
+            let letter = match c.status {
+                ChangeStatus::Add => "A",
+                ChangeStatus::Delete => "D",
+                ChangeStatus::Modify => "M",
+                ChangeStatus::Rename => "R",
+            };
+            match c.status {
+                ChangeStatus::Rename => format!(
+                    "{letter}\t{}\t{}",
+                    c.old_path
+                        .as_ref()
+                        .expect("rename old path")
+                        .display_escaped(),
+                    c.new_path
+                        .as_ref()
+                        .expect("rename new path")
+                        .display_escaped(),
+                ),
+                _ => format!("{letter}\t{}", c.display_path().display_escaped()),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_commit_pair_diff_matches_the_git_oracle() {
+    let repo = shared().repo("main");
+    let set = discover_pair(ROOT, RENAME);
+    let mut got = name_status(&set);
+    let mut expected: Vec<String> = git_name_status(&repo, ROOT, RENAME)
+        .into_iter()
+        // git reports rename similarity ("R100"); tsuiku only records the kind.
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix('R') {
+                let tabbed = rest.split_once('\t').expect("rename has paths").1;
+                format!("R\t{tabbed}")
+            } else {
+                line
+            }
+        })
+        .collect();
+    got.sort();
+    expected.sort();
+    assert!(!got.is_empty());
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn a_commit_pair_in_reverse_swaps_additions_and_deletions() {
+    let forward = discover_pair(MERGE, RENAME);
+    let backward = discover_pair(RENAME, MERGE);
+    let forward_adds: Vec<_> = forward
+        .changes
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Add)
+        .map(|c| c.display_path().display_escaped())
+        .collect();
+    let backward_deletes: Vec<_> = backward
+        .changes
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Delete)
+        .map(|c| c.display_path().display_escaped())
+        .collect();
+    assert!(!forward_adds.is_empty());
+    assert_eq!(forward_adds, backward_deletes);
+}
+
+#[test]
+fn an_identical_commit_pair_has_no_changes() {
+    let set = discover_pair(RENAME, RENAME);
+    assert!(set.changes.is_empty());
+    let repo = shared().repo("main");
+    assert_eq!(
+        set.target,
+        DiffTarget::CommitVsCommit {
+            base: rev_parse(&repo, RENAME),
+            head: rev_parse(&repo, RENAME),
+        }
+    );
+}
+
+#[test]
+fn a_pathspec_limits_a_commit_pair_diff() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    let set = discoverer
+        .discover(&ChangeQuery {
+            target: DiffTarget::CommitVsCommit {
+                base: rev_parse(&repo, ROOT),
+                head: rev_parse(&repo, MERGE),
+            },
+            pathspecs: vec![GitPath::from_bytes(b"side_only.txt")],
+        })
+        .expect("discover");
+    assert_eq!(paths(&set), vec!["side_only.txt".to_string()]);
+}
+
+#[test]
+fn a_missing_side_of_a_commit_pair_is_an_error() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    let missing = tsuiku::ids::Oid([0xab; 20]);
+    let err = discoverer
+        .discover(&ChangeQuery::new(DiffTarget::CommitVsCommit {
+            base: missing,
+            head: rev_parse(&repo, RENAME),
+        }))
+        .expect_err("a missing base fails");
+    assert!(
+        matches!(err, DiscoverError::NoSuchCommit { commit } if commit == missing),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn the_merge_base_matches_the_git_oracle() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    let base = discoverer
+        .merge_base(
+            rev_parse(&repo, "fixture-merge^1"),
+            rev_parse(&repo, "fixture-merge^2"),
+        )
+        .expect("merge base");
+    let output = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(&repo)
+        .args(["merge-base", "fixture-merge^1", "fixture-merge^2"])
+        .output()
+        .expect("run git merge-base");
+    assert!(output.status.success(), "git merge-base failed");
+    let expected = String::from_utf8(output.stdout).expect("hex output");
+    assert_eq!(base.to_hex(), expected.trim());
+}
+
+#[test]
+fn unrelated_histories_have_no_merge_base() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    let orphan = rev_parse(&repo, ORPHAN);
+    let head = rev_parse(&repo, RENAME);
+    let err = discoverer
+        .merge_base(orphan, head)
+        .expect_err("no common ancestor");
+    assert!(
+        matches!(err, DiscoverError::NoMergeBase { base, head: h } if base == orphan && h == head),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn contains_commit_distinguishes_known_from_missing() {
+    let repo = shared().repo("main");
+    let discoverer = GixDiscoverer::open(&repo).expect("open repository");
+    assert!(discoverer.contains_commit(rev_parse(&repo, RENAME)));
+    assert!(!discoverer.contains_commit(tsuiku::ids::Oid([0xab; 20])));
 }
