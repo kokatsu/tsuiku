@@ -23,6 +23,7 @@ use tsuiku::structural::normalize::{StructuralOverlay, normalize};
 use tsuiku::structural::tempfiles::LanguagePathHint;
 use tsuiku::syntax::{DEFAULT_THEME, HighlightAssets, HighlightOutcome, SyntaxSpans};
 use tsuiku::text::{ClassifiedContent, TextContent, classify};
+use tsuiku::theme::{ThemeChoice, theme};
 use tsuiku::view::{build_split_lines, build_unified_lines, build_unified_lines_with_overlay};
 
 fn text(source: String) -> TextContent {
@@ -122,6 +123,7 @@ fn main() {
             &old,
             &new,
             structural_only,
+            theme(ThemeChoice::Dark),
             offset,
             50,
         ));
@@ -129,12 +131,26 @@ fn main() {
 
         let start = Instant::now();
         black_box(build_unified_lines_with_overlay(
-            &rows, &old, &new, full, offset, 50,
+            &rows,
+            &old,
+            &new,
+            full,
+            theme(ThemeChoice::Dark),
+            offset,
+            50,
         ));
         let syntax_elapsed = start.elapsed().as_nanos();
 
         let start = Instant::now();
-        black_box(build_split_lines(&rows, &old, &new, full, offset, 50));
+        black_box(build_split_lines(
+            &rows,
+            &old,
+            &new,
+            full,
+            theme(ThemeChoice::Dark),
+            offset,
+            50,
+        ));
         let split_elapsed = start.elapsed().as_nanos();
 
         // Discard the warm-up prefix rather than the fixture's cold pages.

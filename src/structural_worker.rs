@@ -33,6 +33,23 @@ use crate::text::TextContent;
 pub const MAX_STRUCTURAL_LINES: usize = 5_000;
 pub const MAX_STRUCTURAL_BYTES: usize = 2 * 1024 * 1024;
 
+/// Size guard applied before any difft work is scheduled. Configuration may
+/// move these within clamped bounds; the defaults are the measured values.
+#[derive(Clone, Copy, Debug)]
+pub struct StructuralLimits {
+    pub max_bytes: usize,
+    pub max_lines: usize,
+}
+
+impl Default for StructuralLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_STRUCTURAL_BYTES,
+            max_lines: MAX_STRUCTURAL_LINES,
+        }
+    }
+}
+
 /// A timeout is usually a property of the input, but it can also be transient
 /// load, so it expires rather than sticking for the session.
 const TIMED_OUT_BACKOFF: Duration = Duration::from_secs(30);
@@ -127,6 +144,7 @@ pub struct StructuralDiffCoordinator {
     results: mpsc::Receiver<WorkerMessage>,
     thread: Option<JoinHandle<()>>,
     cancel: CancelFlag,
+    limits: StructuralLimits,
     cache: WeightedLru<StructuralDiffCacheKey, CachedResult>,
     /// `None` until the worker reports the version probe result.
     version: Option<Result<String, StructuralError>>,
@@ -146,7 +164,15 @@ impl StructuralDiffCoordinator {
         Self::with_runner(cache_capacity, DifftRunner::default())
     }
 
-    pub fn with_runner(cache_capacity: usize, mut runner: DifftRunner) -> Self {
+    pub fn with_runner(cache_capacity: usize, runner: DifftRunner) -> Self {
+        Self::with_runner_and_limits(cache_capacity, runner, StructuralLimits::default())
+    }
+
+    pub fn with_runner_and_limits(
+        cache_capacity: usize,
+        mut runner: DifftRunner,
+        limits: StructuralLimits,
+    ) -> Self {
         let cancel = CancelFlag::default();
         runner.cancel = cancel.clone();
         let slot = Arc::new((
@@ -174,6 +200,7 @@ impl StructuralDiffCoordinator {
             backoff: HashMap::new(),
             current_key: None,
             state: AsyncState::NotRequested,
+            limits,
             next_request_id: 1,
             diagnostics_total: 0,
             diagnostics_accepted: 0,
@@ -204,7 +231,7 @@ impl StructuralDiffCoordinator {
         // is nothing worth caching: a repeat request recomputes it in O(1).
         let bytes = old.bytes.len().saturating_add(new.bytes.len());
         let lines = old.lines.len().max(new.lines.len());
-        if bytes > MAX_STRUCTURAL_BYTES || lines > MAX_STRUCTURAL_LINES {
+        if bytes > self.limits.max_bytes || lines > self.limits.max_lines {
             self.state = AsyncState::Skipped(StructuralSkip::SizeLimited);
             return;
         }

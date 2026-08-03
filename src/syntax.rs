@@ -95,10 +95,14 @@ impl HighlightAssets {
         }
     }
 
-    fn theme(&self, _id: ThemeId) -> &Theme {
-        // Theme configuration will map ThemeId values to bundled themes;
-        // until then every id renders with the single built-in theme.
-        &self.themes.themes["base16-ocean.dark"]
+    fn theme(&self, id: ThemeId) -> &Theme {
+        // Unknown ids fall back to the dark theme rather than failing a
+        // whole highlight run; the id is part of the cache key either way.
+        let name = match id {
+            ThemeId(1) => "InspiredGitHub",
+            _ => "base16-ocean.dark",
+        };
+        &self.themes.themes[name]
     }
 
     /// The syntax for a path hint: extension first, then the full basename

@@ -28,7 +28,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -40,16 +40,18 @@ use crate::asyncstate::{
 use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
 use crate::compose::RowOverlays;
+use crate::config::{Config, ViewMode};
 use crate::discover::{CommitRevision, GixDiscoverer};
 use crate::ids::{ContentIdentity, SnapshotId};
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
 use crate::path::GitPath;
 use crate::resolve::{GixResolver, ResolveError};
 use crate::structural::normalize::DifftStatus;
+use crate::structural::runner::DifftRunner;
 use crate::structural::tempfiles::LanguagePathHint;
-use crate::structural_worker::StructuralDiffCoordinator;
-use crate::syntax::DEFAULT_THEME;
+use crate::structural_worker::{StructuralDiffCoordinator, StructuralLimits};
 use crate::syntax_worker::{SideRequest, SyntaxHighlightCoordinator};
+use crate::theme::Theme;
 use crate::view::{SplitLines, build_split_lines, build_unified_lines_with_overlay};
 use crate::watch::EventBatch;
 use crate::watch::runtime::{WatchCoordinator, WatchUpdate};
@@ -64,14 +66,13 @@ const CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LINE_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURAL_DIFF_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SYNTAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
-// Preserve a useful diff body on an 80-column terminal, and remove the
-// sidebar entirely before it would squeeze the diff below 42 columns.
+// The sidebar's fixed share of the terminal. The width thresholds that
+// hide the sidebar or force unified live in `Config` (user-overridable
+// within clamped ranges); their defaults preserve a useful diff body on an
+// 80-column terminal.
 const SIDEBAR_WIDTH: u16 = 30;
+#[cfg(test)]
 const SIDEBAR_MIN_BODY_WIDTH: u16 = 72;
-// Below this many columns of diff area (after the sidebar), a split view
-// would leave under ~60 columns per side; the view falls back to unified
-// while remembering the user's preference for when the terminal widens.
-const SPLIT_MIN_CONTENT_WIDTH: u16 = 120;
 // Metrics are diagnostic and may run for a long session. Bound sample storage
 // independently of the number of input events.
 const MAX_METRIC_SAMPLES: usize = 100_000;
@@ -170,6 +171,11 @@ enum RequestedView<'a> {
 /// so raw mode is also restored after errors and panics.
 pub struct App {
     files: Vec<FileModel>,
+    config: Config,
+    theme: &'static Theme,
+    /// Warnings from loading the config file; also summarized in the title
+    /// and printed to stderr once the terminal is restored.
+    config_warnings: Vec<String>,
     /// The user's split/unified choice. Narrow terminals force unified for
     /// display without touching this, so re-widening restores the choice.
     split_preference: bool,
@@ -244,9 +250,13 @@ impl App {
                 load_error: None,
             })
             .collect();
+        let loaded = crate::config::load();
+        let config = loaded.config;
         let mut app = Self {
             files,
-            split_preference: false,
+            theme: crate::theme::theme(config.theme),
+            config_warnings: loaded.warnings,
+            split_preference: config.view == ViewMode::Split,
             snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
@@ -254,8 +264,19 @@ impl App {
             content_cache: WeightedLru::new(CONTENT_CACHE_BYTES),
             current_content: None,
             worker: LineDiffCoordinator::new(LINE_DIFF_CACHE_BYTES),
-            structural_worker: StructuralDiffCoordinator::new(STRUCTURAL_DIFF_CACHE_BYTES),
+            structural_worker: StructuralDiffCoordinator::with_runner_and_limits(
+                STRUCTURAL_DIFF_CACHE_BYTES,
+                DifftRunner {
+                    timeout: config.difft_timeout,
+                    ..DifftRunner::default()
+                },
+                StructuralLimits {
+                    max_bytes: config.structural_max_bytes,
+                    max_lines: config.structural_max_lines,
+                },
+            ),
             syntax_worker: SyntaxHighlightCoordinator::new(SYNTAX_CACHE_BYTES),
+            config,
             watch: matches!(requested_view, RequestedView::Worktree)
                 .then(|| WatchCoordinator::start(path.to_path_buf())),
             watch_notice: None,
@@ -464,9 +485,10 @@ impl App {
                     Arc::clone(content.old.as_ref().expect("text old side")),
                     Arc::clone(content.new.as_ref().expect("text new side")),
                 );
+                let theme_id = self.theme.syntax_theme;
                 self.syntax_worker.request(
-                    syntax_side(content.pair.old, old_hint, content.old.as_ref()),
-                    syntax_side(content.pair.new, new_hint, content.new.as_ref()),
+                    syntax_side(content.pair.old, old_hint, content.old.as_ref(), theme_id),
+                    syntax_side(content.pair.new, new_hint, content.new.as_ref(), theme_id),
                 );
             }
         }
@@ -762,11 +784,11 @@ impl App {
     fn split_active(&self, terminal_width: u16) -> bool {
         self.split_preference
             && diff_content_width(terminal_width, self.sidebar_shown(terminal_width))
-                >= SPLIT_MIN_CONTENT_WIDTH
+                >= self.config.split_min_width
     }
 
     fn sidebar_shown(&self, terminal_width: u16) -> bool {
-        self.visible_file_count() > 0 && terminal_width >= SIDEBAR_MIN_BODY_WIDTH
+        self.visible_file_count() > 0 && terminal_width >= self.config.sidebar_min_width
     }
 
     fn handle_resize(&mut self, width: u16, height: u16) -> Size {
@@ -800,7 +822,8 @@ impl App {
                 .block(Block::default().borders(Borders::BOTTOM)),
             chunks[0],
         );
-        let (sidebar_area, content) = body_areas(chunks[1], sidebar.is_some());
+        let (sidebar_area, content) =
+            body_areas(chunks[1], sidebar.is_some(), self.config.sidebar_min_width);
         if let (Some(sidebar_area), Some(sidebar)) = (sidebar_area, sidebar) {
             frame.render_widget(
                 Paragraph::new(sidebar).block(Block::default().borders(Borders::RIGHT)),
@@ -824,13 +847,13 @@ impl App {
         }
         frame.render_widget(
             Paragraph::new(" j/k scroll  [/] hunk  n/p file  s split  PgUp/PgDn  q/Ctrl-C quit ")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(self.theme.footer_fg)),
             chunks[2],
         );
     }
 
     fn sidebar_for_body(&self, height: usize, body_width: u16) -> Option<Vec<Line<'static>>> {
-        (self.visible_file_count() > 0 && body_width >= SIDEBAR_MIN_BODY_WIDTH)
+        self.sidebar_shown(body_width)
             .then(|| self.sidebar_lines(height, SIDEBAR_WIDTH))
     }
 
@@ -891,10 +914,12 @@ impl App {
                 let offset = self.scroll.min(max_scroll_for_rows(rows.len(), height));
                 if self.split_active(terminal_width) {
                     return BodyContent::Split(build_split_lines(
-                        rows, old, new, overlays, offset, height,
+                        rows, old, new, overlays, self.theme, offset, height,
                     ));
                 }
-                build_unified_lines_with_overlay(rows, old, new, overlays, offset, height)
+                build_unified_lines_with_overlay(
+                    rows, old, new, overlays, self.theme, offset, height,
+                )
             }
         };
         BodyContent::Single(lines)
@@ -919,11 +944,11 @@ impl App {
                 }
                 let style = if selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::LightCyan)
+                        .fg(self.theme.sidebar_selected_fg)
+                        .bg(self.theme.sidebar_selected_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(self.theme.sidebar_fg)
                 };
                 Line::styled(text, style)
             })
@@ -954,6 +979,14 @@ impl App {
         // columns of app name plus this phrase fit 60 columns.
         if self.split_preference && !self.split_active(terminal_width) {
             prefix.push_str("split: needs a wider terminal  ");
+        }
+        // The full warnings go to stderr once the terminal is restored;
+        // during the session the title only points at their existence.
+        if !self.config_warnings.is_empty() {
+            prefix.push_str(&format!(
+                "config: {} warning(s)  ",
+                self.config_warnings.len()
+            ));
         }
         if let Some(label) = &self.comparison_label {
             prefix.push_str(label);
@@ -1043,6 +1076,7 @@ fn syntax_side(
     identity: ContentIdentity,
     hint: LanguagePathHint,
     text: Option<&Arc<crate::text::TextContent>>,
+    theme_id: crate::syntax::ThemeId,
 ) -> Option<SideRequest> {
     let ContentIdentity::Present(content) = identity else {
         return None;
@@ -1051,7 +1085,7 @@ fn syntax_side(
         key: SyntaxHighlightCacheKey {
             content,
             language_hint: hint,
-            theme_id: DEFAULT_THEME,
+            theme_id,
             highlighter_version: HIGHLIGHTER_VERSION,
             options_fingerprint: 0,
         },
@@ -1129,8 +1163,8 @@ fn split_areas(content: Rect) -> (Rect, Rect) {
     (chunks[0], chunks[1])
 }
 
-fn body_areas(area: Rect, show_sidebar: bool) -> (Option<Rect>, Rect) {
-    if !show_sidebar || area.width < SIDEBAR_MIN_BODY_WIDTH {
+fn body_areas(area: Rect, show_sidebar: bool, sidebar_min_width: u16) -> (Option<Rect>, Rect) {
+    if !show_sidebar || area.width < sidebar_min_width {
         return (None, area);
     }
     let chunks = Layout::default()
@@ -1322,6 +1356,14 @@ fn install_panic_hook() {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Printed after the alternate screen is left, so the full warning
+        // text survives in the scrollback where the title chip could not
+        // show it. Warnings quote config content (quoted keys may legally
+        // contain escapes), so they are escaped like every other untrusted
+        // string before reaching the terminal.
+        for warning in &self.config_warnings {
+            eprintln!("{}", terminal_safe_label(warning));
+        }
         if !self.metrics_enabled {
             return;
         }
@@ -1375,6 +1417,7 @@ mod tests {
     use crate::path::GitPath;
     use crate::text::{ClassifiedContent, classify};
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn change(status_path: &[u8]) -> FileChange {
         FileChange::classify(
@@ -1405,6 +1448,9 @@ mod tests {
                     load_error: None,
                 },
             ],
+            config: Config::default(),
+            theme: crate::theme::theme(crate::theme::ThemeChoice::Dark),
+            config_warnings: Vec::new(),
             split_preference: false,
             snapshot: SnapshotId(1),
             selected: 0,
@@ -1537,10 +1583,13 @@ mod tests {
     #[test]
     fn sidebar_disappears_before_it_squeezes_the_diff_body() {
         let narrow = Rect::new(3, 4, SIDEBAR_MIN_BODY_WIDTH - 1, 20);
-        assert_eq!(body_areas(narrow, true), (None, narrow));
+        assert_eq!(
+            body_areas(narrow, true, SIDEBAR_MIN_BODY_WIDTH),
+            (None, narrow)
+        );
 
         let wide = Rect::new(3, 4, SIDEBAR_MIN_BODY_WIDTH, 20);
-        let (sidebar, content) = body_areas(wide, true);
+        let (sidebar, content) = body_areas(wide, true, SIDEBAR_MIN_BODY_WIDTH);
         assert_eq!(sidebar, Some(Rect::new(3, 4, SIDEBAR_WIDTH, 20)));
         assert_eq!(
             content,
@@ -1551,7 +1600,10 @@ mod tests {
                 20
             )
         );
-        assert_eq!(body_areas(wide, false), (None, wide));
+        assert_eq!(
+            body_areas(wide, false, SIDEBAR_MIN_BODY_WIDTH),
+            (None, wide)
+        );
     }
 
     #[test]
@@ -2681,6 +2733,72 @@ mod tests {
             last_content.symbol().chars().count() <= 1,
             "no half character at the truncation point"
         );
+    }
+
+    #[test]
+    fn all_views_render_under_both_bundled_themes() {
+        // No view may fall apart in any of the three states (no config =
+        // dark default, dark, light). Unified, split and the sidebar are
+        // drawn per theme and the palette must actually reach the buffer.
+        for choice in [
+            crate::theme::ThemeChoice::Dark,
+            crate::theme::ThemeChoice::Light,
+        ] {
+            let mut app = test_app();
+            app.theme = crate::theme::theme(choice);
+            app.activate_content(prepared_text(
+                "removed 行\ncommon 共通\n",
+                "added 行\ncommon 共通\n",
+            ));
+            wait_for_line_diff(&mut app);
+
+            // Unified with sidebar at 80 columns.
+            let mut unified = Terminal::new(TestBackend::new(80, 10)).expect("test terminal");
+            let body = app.body_content(body_height(10), 80);
+            let sidebar = app.sidebar_for_body(body_height(10), 80);
+            unified
+                .draw(|frame| app.draw(frame, app.title(80), body, sidebar))
+                .expect("unified draw");
+            let buffer = unified.backend().buffer();
+            assert_eq!(buffer.cell((29, 2)).expect("sidebar border").symbol(), "│");
+            let removed_cell = buffer.cell((31, 2)).expect("removed row cell");
+            assert_eq!(
+                removed_cell.bg, app.theme.removed_bg,
+                "the theme palette must reach the removed row"
+            );
+
+            // Split at 160 columns.
+            app.split_preference = true;
+            let mut split = Terminal::new(TestBackend::new(160, 10)).expect("test terminal");
+            let body = app.body_content(body_height(10), 160);
+            let sidebar = app.sidebar_for_body(body_height(10), 160);
+            split
+                .draw(|frame| app.draw(frame, app.title(160), body, sidebar))
+                .expect("split draw");
+            let buffer = split.backend().buffer();
+            assert_eq!(buffer.cell((94, 2)).expect("split divider").symbol(), "│");
+        }
+    }
+
+    #[test]
+    fn config_warnings_print_terminal_safe() {
+        // The Drop output path runs warnings through terminal_safe_label;
+        // a quoted-key escape from the config file must not reach the
+        // terminal raw.
+        let warning = "config: unknown key `evil\u{1b}[31mkey` ignored";
+        let printed = terminal_safe_label(warning);
+        assert!(!printed.contains('\u{1b}'));
+        assert!(printed.contains(r"evil\u{1b}[31mkey"));
+    }
+
+    #[test]
+    fn config_warnings_surface_as_a_title_chip() {
+        let mut app = test_app();
+        app.config_warnings = vec!["config: unknown key `x` ignored".to_owned()];
+        assert!(app.title(120).contains("config: 1 warning(s)"));
+
+        app.config_warnings.clear();
+        assert!(!app.title(120).contains("config:"));
     }
 
     #[test]

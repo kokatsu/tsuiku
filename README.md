@@ -20,7 +20,41 @@ tsuiku              # compare HEAD against the final worktree state
 tsuiku show <rev>   # compare a commit against its first parent
 ```
 
-Main keys: `j`/`k` to move by line, `]`/`[` to jump between hunks, `q` to quit.
+Main keys: `j`/`k` to move by line, `]`/`[` to jump between hunks, `n`/`p` to
+switch files, `s` to toggle the side-by-side split view, `q` to quit.
+
+The worktree view refreshes automatically: edits, staging, commits, branch
+switches and ignore-rule changes are picked up while tsuiku is running.
+
+## Configuration
+
+Optional. Everything works without a file; settings only override defaults.
+
+Location: `$XDG_CONFIG_HOME/tsuiku/config.toml` (XDG-first even on macOS;
+`~/.config/tsuiku/config.toml` when `XDG_CONFIG_HOME` is unset). Only
+absolute `XDG_CONFIG_HOME`/`HOME` values are honored.
+
+```toml
+theme = "dark"                    # "dark" (default) or "light"
+view = "unified"                  # initial layout: "unified" (default) or "split"
+sidebar_min_width = 72            # hide the file sidebar below this terminal width
+split_min_width = 120             # fall back to unified below this diff-area width
+difft_timeout_seconds = 5         # difftastic subprocess timeout
+structural_max_bytes = 2097152    # skip structural diffs for larger pairs
+structural_max_lines = 5000       # skip structural diffs for longer files
+```
+
+Numeric settings are clamped so a config cannot break responsiveness:
+`sidebar_min_width` 48–300, `split_min_width` 60–400,
+`difft_timeout_seconds` 1–30, `structural_max_bytes` 524288–8388608,
+`structural_max_lines` 1250–20000.
+
+Invalid input never prevents startup: a TOML syntax error rejects the whole
+file (warning with position, all defaults), out-of-range numbers are clamped
+with a warning, an unknown theme falls back to the default theme, and unknown
+keys are ignored. Except for the syntax error, each problem is per-setting
+and keeps the other settings effective. Every case reports itself in the
+title bar (`config: N warning(s)`) with the full text printed after exit.
 
 ## Limitations
 

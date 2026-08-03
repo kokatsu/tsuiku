@@ -9,6 +9,7 @@ use crate::linediff::DiffRow;
 use crate::structural::normalize::HighlightKind;
 use crate::syntax::SyntaxFg;
 use crate::text::TextContent;
+use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::fmt::Write;
@@ -82,7 +83,15 @@ pub fn build_unified_lines<'a>(
     offset: usize,
     height: usize,
 ) -> Vec<Line<'a>> {
-    build_unified_lines_with_overlay(rows, old, new, RowOverlays::default(), offset, height)
+    build_unified_lines_with_overlay(
+        rows,
+        old,
+        new,
+        RowOverlays::default(),
+        crate::theme::theme(crate::theme::ThemeChoice::Dark),
+        offset,
+        height,
+    )
 }
 
 /// Build a viewport while applying validated structural and syntax spans.
@@ -93,6 +102,7 @@ pub fn build_unified_lines_with_overlay<'a>(
     old: &'a TextContent,
     new: &'a TextContent,
     overlays: RowOverlays<'a>,
+    theme: &Theme,
     offset: usize,
     height: usize,
 ) -> Vec<Line<'a>> {
@@ -105,8 +115,8 @@ pub fn build_unified_lines_with_overlay<'a>(
             let row = compose_row(row, old, new, overlays);
             let (marker, line_style) = match row.kind {
                 ComposedRowKind::Context => (' ', Style::default()),
-                ComposedRowKind::Removed => ('-', Style::default().bg(Color::Rgb(60, 20, 25))),
-                ComposedRowKind::Added => ('+', Style::default().bg(Color::Rgb(15, 55, 35))),
+                ComposedRowKind::Removed => ('-', Style::default().bg(theme.removed_bg)),
+                ComposedRowKind::Added => ('+', Style::default().bg(theme.added_bg)),
             };
             let mut prefix = String::with_capacity(number_width * 2 + 5);
             push_number(
@@ -126,7 +136,7 @@ pub fn build_unified_lines_with_overlay<'a>(
             spans.extend(row.segments.into_iter().map(|segment| {
                 Span::styled(
                     segment.text,
-                    segment_style(line_style, segment.structural, segment.syntax),
+                    segment_style(theme, line_style, segment.structural, segment.syntax),
                 )
             }));
             Line::from(spans)
@@ -153,6 +163,7 @@ pub fn build_split_lines<'a>(
     old: &'a TextContent,
     new: &'a TextContent,
     overlays: RowOverlays<'a>,
+    theme: &Theme,
     offset: usize,
     height: usize,
 ) -> SplitLines<'a> {
@@ -165,20 +176,19 @@ pub fn build_split_lines<'a>(
                 Some((o, ' ', Style::default())),
                 Some((n, ' ', Style::default())),
             ),
-            DiffRow::Removed { old: o } => (
-                Some((o, '-', Style::default().bg(Color::Rgb(60, 20, 25)))),
-                None,
-            ),
-            DiffRow::Added { new: n } => (
-                None,
-                Some((n, '+', Style::default().bg(Color::Rgb(15, 55, 35)))),
-            ),
+            DiffRow::Removed { old: o } => {
+                (Some((o, '-', Style::default().bg(theme.removed_bg))), None)
+            }
+            DiffRow::Added { new: n } => {
+                (None, Some((n, '+', Style::default().bg(theme.added_bg))))
+            }
         };
         left.push(side_line(
             left_line,
             old,
             overlays.structural.map(|ov| &ov.old),
             overlays.syntax_old,
+            theme,
             number_width,
         ));
         right.push(side_line(
@@ -186,6 +196,7 @@ pub fn build_split_lines<'a>(
             new,
             overlays.structural.map(|ov| &ov.new),
             overlays.syntax_new,
+            theme,
             number_width,
         ));
     }
@@ -198,6 +209,7 @@ fn side_line<'a>(
     text: &'a TextContent,
     structural: Option<&'a crate::structural::normalize::SideOverlay>,
     syntax: Option<&'a crate::syntax::SyntaxSpans>,
+    theme: &Theme,
     number_width: usize,
 ) -> Line<'a> {
     let Some((line, marker, line_style)) = cell else {
@@ -216,7 +228,7 @@ fn side_line<'a>(
     spans.extend(segments.into_iter().map(|segment| {
         Span::styled(
             segment.text,
-            segment_style(line_style, segment.structural, segment.syntax),
+            segment_style(theme, line_style, segment.structural, segment.syntax),
         )
     }));
     Line::from(spans)
@@ -226,22 +238,15 @@ fn side_line<'a>(
 /// foreground, which beats the line-diff default; a structural background
 /// beats the line background; syntax never touches background or attributes.
 fn segment_style(
+    theme: &Theme,
     base: Style,
     structural: Option<HighlightKind>,
     syntax: Option<SyntaxFg>,
 ) -> Style {
     if let Some(highlight) = structural {
-        let foreground = match highlight {
-            HighlightKind::Keyword => Color::LightMagenta,
-            HighlightKind::String => Color::LightYellow,
-            HighlightKind::Comment => Color::Gray,
-            HighlightKind::Delimiter => Color::LightCyan,
-            HighlightKind::TypeName => Color::LightBlue,
-            HighlightKind::Normal | HighlightKind::Other => Color::White,
-        };
         return base
-            .fg(foreground)
-            .bg(Color::Rgb(85, 65, 15))
+            .fg(theme.structural_fg(highlight))
+            .bg(theme.structural_bg)
             .add_modifier(Modifier::BOLD);
     }
     match syntax {
@@ -269,6 +274,10 @@ mod tests {
     use crate::coords::LineIndex;
     use crate::text::{ClassifiedContent, classify};
     use std::sync::Arc;
+
+    fn dark() -> &'static Theme {
+        crate::theme::theme(crate::theme::ThemeChoice::Dark)
+    }
 
     fn text(s: &str) -> TextContent {
         match classify(Arc::from(s.as_bytes())) {
@@ -340,6 +349,7 @@ mod tests {
                 structural: Some(&overlay),
                 ..RowOverlays::default()
             },
+            dark(),
             0,
             1,
         );
@@ -376,7 +386,7 @@ mod tests {
             DiffRow::Added { new: LineIndex(1) },
         ];
 
-        let split = build_split_lines(&rows, &old, &new, RowOverlays::default(), 0, 10);
+        let split = build_split_lines(&rows, &old, &new, RowOverlays::default(), dark(), 0, 10);
 
         assert_eq!(split.left.len(), 3);
         assert_eq!(split.right.len(), 3);
@@ -401,7 +411,7 @@ mod tests {
                 new: LineIndex(index),
             })
             .collect();
-        let split = build_split_lines(&rows, &old, &new, RowOverlays::default(), 1, 2);
+        let split = build_split_lines(&rows, &old, &new, RowOverlays::default(), dark(), 1, 2);
         assert_eq!(split.left.len(), 2);
         assert_eq!(line_text(&split.left[0]), "    2   b");
         assert_eq!(line_text(&split.right[1]), "    3   c");
@@ -433,6 +443,7 @@ mod tests {
                 structural: Some(&overlay),
                 ..RowOverlays::default()
             },
+            dark(),
             0,
             10,
         );
@@ -486,6 +497,7 @@ mod tests {
                 syntax_old: Some(&spans),
                 syntax_new: None,
             },
+            dark(),
             0,
             10,
         );
@@ -508,18 +520,18 @@ mod tests {
         };
 
         // Syntax alone: foreground only, background and attributes untouched.
-        let syntax_only = segment_style(base, None, Some(syntax));
+        let syntax_only = segment_style(dark(), base, None, Some(syntax));
         assert_eq!(syntax_only.fg, Some(Color::Rgb(10, 20, 30)));
         assert_eq!(syntax_only.bg, base.bg);
         assert_eq!(syntax_only.add_modifier, Modifier::empty());
 
         // Structural beats syntax on foreground and the line bg on background.
-        let both = segment_style(base, Some(HighlightKind::String), Some(syntax));
+        let both = segment_style(dark(), base, Some(HighlightKind::String), Some(syntax));
         assert_eq!(both.fg, Some(Color::LightYellow));
         assert_eq!(both.bg, Some(Color::Rgb(85, 65, 15)));
         assert!(both.add_modifier.contains(Modifier::BOLD));
 
         // Neither layer: the line-diff style passes through unchanged.
-        assert_eq!(segment_style(base, None, None), base);
+        assert_eq!(segment_style(dark(), base, None, None), base);
     }
 }

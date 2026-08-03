@@ -29,6 +29,7 @@ serde_json = "1.0.151"
 similar = "3.1.1"
 syntect = "5.3.0"
 tempfile = "3.27.0"
+toml = "0.9.11"
 two-face = "0.5.1"
 unicode-width = "0.2.2"
 
