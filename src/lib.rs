@@ -11,6 +11,8 @@ pub mod compose;
 pub mod config;
 pub mod coords;
 pub mod discover;
+pub(crate) mod exec;
+pub mod gh;
 pub mod ids;
 pub mod linediff;
 pub mod loader;

@@ -16,8 +16,12 @@ visually distinguish formatting-only changes from essential ones.
 ## Usage
 
 ```
-tsuiku              # compare HEAD against the final worktree state
-tsuiku show <rev>   # compare a commit against its first parent
+tsuiku                      # compare HEAD against the final worktree state
+tsuiku show <rev>           # compare a commit against its first parent
+tsuiku pr [<selector>]      # view a GitHub pull request (needs the gh CLI)
+tsuiku diff <rev1> <rev2>   # compare two revisions directly
+tsuiku diff <rev1>..<rev2>  # the same, as one range argument
+tsuiku diff <rev1>...<rev2> # merge base of the two against rev2
 ```
 
 Main keys: `j`/`k` to move by line, `]`/`[` to jump between hunks, `n`/`p` to
@@ -25,6 +29,14 @@ switch files, `s` to toggle the side-by-side split view, `q` to quit.
 
 The worktree view refreshes automatically: edits, staging, commits, branch
 switches and ignore-rule changes are picked up while tsuiku is running.
+
+`tsuiku pr` resolves the pull request through an authenticated
+[GitHub CLI](https://cli.github.com) (`gh`); the selector is a PR number, URL,
+or branch, and without one gh picks the current branch's PR. The diff is shown
+the way GitHub shows it — the merge base of the base branch against the PR
+head — and is computed locally. When the PR commits are not available locally
+tsuiku fetches them once into the object database without creating any local
+ref.
 
 ## Configuration
 

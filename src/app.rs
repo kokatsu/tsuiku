@@ -41,7 +41,7 @@ use crate::cache::WeightedLru;
 use crate::change::{ChangeDiscoverer, ChangeQuery, ChangeStatus, DiffTarget, FileChange};
 use crate::compose::RowOverlays;
 use crate::config::{Config, ViewMode};
-use crate::discover::{CommitRevision, GixDiscoverer};
+use crate::discover::GixDiscoverer;
 use crate::ids::{ContentIdentity, SnapshotId};
 use crate::loader::{ContentLoadCoordinator, LoadResult, PreparedContent, PreparedKind};
 use crate::path::GitPath;
@@ -86,6 +86,8 @@ const UNSTABLE_RETRY_DELAY: Duration = Duration::from_millis(200);
 pub enum AppError {
     /// Git repository discovery or change enumeration failed.
     Discover(crate::change::DiscoverError),
+    /// Resolving a pull request through gh failed.
+    Pr(crate::gh::GhError),
     /// Terminal setup, input, or drawing failed.
     Io(io::Error),
     /// Standard input or output is not connected to an interactive terminal.
@@ -96,6 +98,7 @@ impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Discover(e) => write!(f, "{e}"),
+            Self::Pr(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::NotTerminal => write!(f, "tsuiku requires an interactive terminal"),
         }
@@ -162,6 +165,15 @@ impl FirstContentKind {
 enum RequestedView<'a> {
     Worktree,
     Show(&'a [u8]),
+    /// A pull request; `None` asks gh for the current branch's PR.
+    Pr(Option<&'a std::ffi::OsStr>),
+    /// Two revisions; with `merge_base` the base side is replaced by the
+    /// merge base of the two (git's three-dot comparison).
+    Diff {
+        base: &'a [u8],
+        head: &'a [u8],
+        merge_base: bool,
+    },
 }
 
 /// Mutable state of one interactive diff-viewer session.
@@ -223,19 +235,12 @@ impl App {
 
     fn load(
         path: &Path,
-        requested_view: RequestedView<'_>,
+        discoverer: GixDiscoverer,
+        target: DiffTarget,
+        comparison_label: Option<String>,
+        watch: bool,
         started_at: Instant,
     ) -> Result<Self, AppError> {
-        let discoverer = GixDiscoverer::open(path).map_err(AppError::Discover)?;
-        let resolved = match requested_view {
-            RequestedView::Worktree => None,
-            RequestedView::Show(revision) => Some(
-                discoverer
-                    .resolve_commit_revision(revision)
-                    .map_err(AppError::Discover)?,
-            ),
-        };
-        let (target, comparison_label) = requested_target(requested_view, resolved);
         let set = discoverer
             .discover(&ChangeQuery::new(target))
             .map_err(AppError::Discover)?;
@@ -277,8 +282,7 @@ impl App {
             ),
             syntax_worker: SyntaxHighlightCoordinator::new(SYNTAX_CACHE_BYTES),
             config,
-            watch: matches!(requested_view, RequestedView::Worktree)
-                .then(|| WatchCoordinator::start(path.to_path_buf())),
+            watch: watch.then(|| WatchCoordinator::start(path.to_path_buf())),
             watch_notice: None,
             unstable_retry: None,
             comparison_label,
@@ -641,9 +645,44 @@ impl App {
         Self::run_requested(path, RequestedView::Show(revision))
     }
 
+    /// Show a pull request the way GitHub does: its merge base against its
+    /// head. gh resolves the metadata; `selector` is a number, URL, or
+    /// branch, and `None` means the current branch's PR.
+    pub fn run_pr(path: &Path, selector: Option<&std::ffi::OsStr>) -> Result<(), AppError> {
+        Self::run_requested(path, RequestedView::Pr(selector))
+    }
+
+    /// Show two revisions against each other; with `merge_base` the base
+    /// side is their merge base (a three-dot comparison).
+    pub fn run_diff(
+        path: &Path,
+        base: &[u8],
+        head: &[u8],
+        merge_base: bool,
+    ) -> Result<(), AppError> {
+        Self::run_requested(
+            path,
+            RequestedView::Diff {
+                base,
+                head,
+                merge_base,
+            },
+        )
+    }
+
     fn run_requested(path: &Path, requested_view: RequestedView<'_>) -> Result<(), AppError> {
         Self::require_terminal()?;
         let started_at = Instant::now();
+        let discoverer = GixDiscoverer::open(path).map_err(AppError::Discover)?;
+        // The PR view runs gh and possibly a fetch — network calls that can
+        // take tens of seconds. They happen before raw mode on purpose:
+        // inside it no event loop is running yet, so Ctrl-C would be dead
+        // for the whole wait. Out here the default SIGINT handling applies.
+        if matches!(requested_view, RequestedView::Pr(_)) {
+            eprintln!("resolving pull request via gh…");
+        }
+        let (target, comparison_label) = resolve_view(&discoverer, requested_view)?;
+        let watch = matches!(requested_view, RequestedView::Worktree);
         install_panic_hook();
         let guard = TerminalGuard::enter()?;
         let backend = CrosstermBackend::new(io::stdout());
@@ -652,7 +691,14 @@ impl App {
             frame.render_widget(Paragraph::new("Discovering changes…"), frame.area());
         })?;
         let terminal_initialized = elapsed_micros(started_at);
-        let mut app = Self::load(path, requested_view, started_at)?;
+        let mut app = Self::load(
+            path,
+            discoverer,
+            target,
+            comparison_label,
+            watch,
+            started_at,
+        )?;
         app.terminal_initialized_micros
             .set(Some(terminal_initialized));
         let result = app.event_loop(&mut terminal);
@@ -1093,20 +1139,128 @@ fn syntax_side(
     })
 }
 
-fn requested_target(
+/// Fetching PR objects can move real data; give it more room than the
+/// metadata call.
+const PR_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Turn the requested view into a concrete diff target and its title label.
+/// For a PR this is where gh runs and missing commits are fetched.
+fn resolve_view(
+    discoverer: &GixDiscoverer,
     requested_view: RequestedView<'_>,
-    resolved: Option<CommitRevision>,
-) -> (DiffTarget, Option<String>) {
-    match (requested_view, resolved) {
-        (RequestedView::Worktree, None) => (DiffTarget::WorktreeVsHead, None),
-        (RequestedView::Show(revision), Some(resolved)) => (
-            DiffTarget::CommitVsParent {
-                commit: resolved.commit,
-            },
-            Some(commit_comparison_label(revision, resolved.has_parent)),
-        ),
-        _ => unreachable!("only show revisions have resolved commit metadata"),
+) -> Result<(DiffTarget, Option<String>), AppError> {
+    match requested_view {
+        RequestedView::Worktree => Ok((DiffTarget::WorktreeVsHead, None)),
+        RequestedView::Show(revision) => {
+            let resolved = discoverer
+                .resolve_commit_revision(revision)
+                .map_err(AppError::Discover)?;
+            Ok((
+                DiffTarget::CommitVsParent {
+                    commit: resolved.commit,
+                },
+                Some(commit_comparison_label(revision, resolved.has_parent)),
+            ))
+        }
+        RequestedView::Pr(selector) => {
+            let workdir = discoverer
+                .path_resolver()
+                .ok_or(AppError::Pr(crate::gh::GhError::NoWorkdir))?
+                .workdir()
+                .to_path_buf();
+            // gh and the fetch children live in their own process groups, so
+            // a terminal Ctrl-C never reaches them and the parent's default
+            // death would orphan them mid-run. Route SIGINT into the shared
+            // cancel flag instead: the guarded wait kills and reaps the
+            // child, and the run surfaces as GhError::Interrupted.
+            let (sigint_guard, cancel) = crate::exec::SigintCancel::install();
+            let client = crate::gh::GhClient {
+                cancel: cancel.clone(),
+                ..Default::default()
+            };
+            let info = client.pr_view(&workdir, selector).map_err(AppError::Pr)?;
+            crate::gh::ensure_pr_commits(
+                discoverer,
+                &workdir,
+                &info,
+                PR_FETCH_TIMEOUT,
+                cancel.clone(),
+            )
+            .map_err(AppError::Pr)?;
+            // No child is running from here on, so restore the default
+            // SIGINT before the merge-base walk: a Ctrl-C during the walk
+            // kills the process directly instead of setting a flag nothing
+            // reads. The check after the restore catches a signal that
+            // arrived while the handler was still installed.
+            drop(sigint_guard);
+            if cancel.is_cancelled() {
+                return Err(AppError::Pr(crate::gh::GhError::Interrupted));
+            }
+            // GitHub shows a PR as merge-base(base, head)...head.
+            let merge_base = discoverer
+                .merge_base(info.base_ref_oid, info.head_ref_oid)
+                .map_err(AppError::Discover)?;
+            Ok((
+                DiffTarget::CommitVsCommit {
+                    base: merge_base,
+                    head: info.head_ref_oid,
+                },
+                Some(pr_comparison_label(&info)),
+            ))
+        }
+        RequestedView::Diff {
+            base,
+            head,
+            merge_base,
+        } => {
+            let resolve = |revision: &[u8]| {
+                discoverer
+                    .resolve_commit_revision(revision)
+                    .map(|r| r.commit)
+                    .map_err(AppError::Discover)
+            };
+            let base_commit = resolve(base)?;
+            let head_commit = resolve(head)?;
+            let old = if merge_base {
+                discoverer
+                    .merge_base(base_commit, head_commit)
+                    .map_err(AppError::Discover)?
+            } else {
+                base_commit
+            };
+            Ok((
+                DiffTarget::CommitVsCommit {
+                    base: old,
+                    head: head_commit,
+                },
+                Some(diff_comparison_label(base, head, merge_base)),
+            ))
+        }
     }
+}
+
+/// Width the PR title is clipped to in the title line; the rest of the label
+/// still has to fit alongside it.
+const PR_TITLE_MAX_WIDTH: usize = 40;
+
+fn pr_comparison_label(info: &crate::gh::PrInfo) -> String {
+    // The title and branch names are external text headed for the terminal.
+    let title = truncate_display_width(&terminal_safe_label(&info.title), PR_TITLE_MAX_WIDTH);
+    format!(
+        "PR #{} {title} ({}...{})",
+        info.number,
+        terminal_safe_label(&info.base_ref_name),
+        terminal_safe_label(&info.head_ref_name),
+    )
+}
+
+fn diff_comparison_label(base: &[u8], head: &[u8], merge_base: bool) -> String {
+    let separator = if merge_base { "..." } else { ".." };
+    format!(
+        "comparing {}{separator}{}",
+        GitPath::from_bytes(base).display_escaped(),
+        GitPath::from_bytes(head).display_escaped(),
+    )
 }
 
 fn commit_comparison_label(revision: &[u8], has_parent: bool) -> String {
@@ -1857,38 +2011,38 @@ mod tests {
     }
 
     #[test]
-    fn requested_view_selects_the_target_and_comparison_label_together() {
+    fn a_pr_label_escapes_and_clips_the_title() {
+        let mut info = crate::gh::PrInfo {
+            number: 123,
+            title: "Fix the frobnicator".to_string(),
+            state: "OPEN".to_string(),
+            base_ref_name: "main".to_string(),
+            base_ref_oid: Oid([1; 20]),
+            head_ref_name: "feature/frob".to_string(),
+            head_ref_oid: Oid([2; 20]),
+            is_cross_repository: false,
+            url: "https://github.com/octo/frob/pull/123".to_string(),
+        };
         assert_eq!(
-            requested_target(RequestedView::Worktree, None),
-            (DiffTarget::WorktreeVsHead, None)
+            pr_comparison_label(&info),
+            "PR #123 Fix the frobnicator (main...feature/frob)"
         );
 
-        let commit = Oid([7; 20]);
+        info.title = "evil\x1b[31m title padded well past the forty column clip point".into();
+        let label = pr_comparison_label(&info);
+        assert!(!label.contains('\x1b'), "controls are escaped: {label}");
+        assert!(label.contains('…'), "over-wide titles are clipped: {label}");
+    }
+
+    #[test]
+    fn a_diff_label_shows_the_range_syntax_that_was_asked_for() {
         assert_eq!(
-            requested_target(
-                RequestedView::Show(b"HEAD"),
-                Some(CommitRevision {
-                    commit,
-                    has_parent: true,
-                }),
-            ),
-            (
-                DiffTarget::CommitVsParent { commit },
-                Some("comparing HEAD^1..HEAD".to_owned()),
-            )
+            diff_comparison_label(b"main", b"feature", false),
+            "comparing main..feature"
         );
         assert_eq!(
-            requested_target(
-                RequestedView::Show(b"fixture-root"),
-                Some(CommitRevision {
-                    commit,
-                    has_parent: false,
-                }),
-            ),
-            (
-                DiffTarget::CommitVsParent { commit },
-                Some("comparing empty..fixture-root".to_owned()),
-            )
+            diff_comparison_label(b"main", b"feature", true),
+            "comparing main...feature"
         );
     }
 
