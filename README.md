@@ -25,7 +25,8 @@ tsuiku diff <rev1>...<rev2> # merge base of the two against rev2
 ```
 
 Main keys: `j`/`k` to move by line, `]`/`[` to jump between hunks, `n`/`p` to
-switch files, `s` to toggle the side-by-side split view, `q` to quit.
+switch files, `f` to cycle the status filter (all → added → modified → deleted
+→ renamed), `s` to toggle the side-by-side split view, `q` to quit.
 
 The worktree view refreshes automatically: edits, staging, commits, branch
 switches and ignore-rule changes are picked up while tsuiku is running.

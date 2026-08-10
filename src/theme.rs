@@ -7,6 +7,7 @@
 
 use ratatui::style::Color;
 
+use crate::change::ChangeStatus;
 use crate::structural::normalize::HighlightKind;
 use crate::syntax::ThemeId;
 
@@ -42,6 +43,10 @@ pub struct Theme {
     pub sidebar_fg: Color,
     pub sidebar_selected_fg: Color,
     pub sidebar_selected_bg: Color,
+    status_add_fg: Color,
+    status_modify_fg: Color,
+    status_delete_fg: Color,
+    status_rename_fg: Color,
     pub footer_fg: Color,
     /// The syntect theme rendering syntax foregrounds.
     pub syntax_theme: ThemeId,
@@ -57,6 +62,18 @@ impl Theme {
             HighlightKind::Delimiter => self.delimiter_fg,
             HighlightKind::TypeName => self.type_fg,
             HighlightKind::Normal | HighlightKind::Other => self.other_fg,
+        }
+    }
+
+    /// Foreground for the leading status marker (A/M/D/R) in the sidebar.
+    /// Not applied on the selected row, which keeps its uniform highlight
+    /// pair instead of mixing in a third color.
+    pub fn status_fg(&self, status: ChangeStatus) -> Color {
+        match status {
+            ChangeStatus::Add => self.status_add_fg,
+            ChangeStatus::Modify => self.status_modify_fg,
+            ChangeStatus::Delete => self.status_delete_fg,
+            ChangeStatus::Rename => self.status_rename_fg,
         }
     }
 }
@@ -76,6 +93,10 @@ static DARK: Theme = Theme {
     sidebar_fg: Color::DarkGray,
     sidebar_selected_fg: Color::Black,
     sidebar_selected_bg: Color::LightCyan,
+    status_add_fg: Color::LightGreen,
+    status_modify_fg: Color::LightYellow,
+    status_delete_fg: Color::LightRed,
+    status_rename_fg: Color::LightCyan,
     footer_fg: Color::DarkGray,
     syntax_theme: ThemeId(0),
 };
@@ -95,6 +116,10 @@ static LIGHT: Theme = Theme {
     sidebar_fg: Color::Rgb(100, 100, 100),
     sidebar_selected_fg: Color::White,
     sidebar_selected_bg: Color::Rgb(0, 95, 135),
+    status_add_fg: Color::Rgb(0, 130, 0),
+    status_modify_fg: Color::Rgb(150, 110, 0),
+    status_delete_fg: Color::Rgb(190, 0, 0),
+    status_rename_fg: Color::Rgb(0, 110, 110),
     footer_fg: Color::Rgb(100, 100, 100),
     syntax_theme: ThemeId(1),
 };

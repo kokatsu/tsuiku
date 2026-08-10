@@ -29,7 +29,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -138,6 +138,61 @@ struct FileModel {
     load_error: Option<ResolveError>,
 }
 
+/// A cyclic selector over [`ChangeStatus`]; the `f` key advances it. `All`
+/// is the resting state that excludes nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum StatusFilter {
+    #[default]
+    All,
+    Only(ChangeStatus),
+}
+
+impl StatusFilter {
+    fn matches(self, status: ChangeStatus) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(target) => target == status,
+        }
+    }
+
+    /// The next state in the fixed cycle: the A/M/D/R display order, not
+    /// the `ChangeStatus` declaration order.
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Only(ChangeStatus::Add),
+            Self::Only(ChangeStatus::Add) => Self::Only(ChangeStatus::Modify),
+            Self::Only(ChangeStatus::Modify) => Self::Only(ChangeStatus::Delete),
+            Self::Only(ChangeStatus::Delete) => Self::Only(ChangeStatus::Rename),
+            Self::Only(ChangeStatus::Rename) => Self::All,
+        }
+    }
+
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Only(ChangeStatus::Add) => Some("Add"),
+            Self::Only(ChangeStatus::Modify) => Some("Modify"),
+            Self::Only(ChangeStatus::Delete) => Some("Delete"),
+            Self::Only(ChangeStatus::Rename) => Some("Rename"),
+        }
+    }
+}
+
+/// What excludes a file from navigation and the sidebar. `no_op` is a
+/// property of the file itself (its sides resolved to identical bytes);
+/// the status filter is interactive state layered on top. Every consumer
+/// of "is this file visible" goes through [`Self::matches`].
+#[derive(Clone, Copy)]
+struct Visibility {
+    status: StatusFilter,
+}
+
+impl Visibility {
+    fn matches(self, file: &FileModel) -> bool {
+        !file.no_op && self.status.matches(file.change.status)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FirstContentKind {
     Text,
@@ -191,6 +246,9 @@ pub struct App {
     /// The user's split/unified choice. Narrow terminals force unified for
     /// display without touching this, so re-widening restores the choice.
     split_preference: bool,
+    /// Session-only status restriction on the file list; survives watch
+    /// re-discovers like `split_preference` survives resizes.
+    status_filter: StatusFilter,
     /// Generation of `files`. Bumped by every re-discover; background load
     /// results from an older generation are rejected outright because their
     /// file indices may point at different files now.
@@ -262,6 +320,7 @@ impl App {
             theme: crate::theme::theme(config.theme),
             config_warnings: loaded.warnings,
             split_preference: config.view == ViewMode::Split,
+            status_filter: StatusFilter::All,
             snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
@@ -368,13 +427,21 @@ impl App {
             })
             .collect();
         self.content_cache = WeightedLru::new(CONTENT_CACHE_BYTES);
-        let repositioned = previous_path.and_then(|path| {
-            self.files
-                .iter()
-                .position(|file| file.change.display_path() == &path)
-        });
-        self.selected =
-            repositioned.unwrap_or_else(|| self.selected.min(self.files.len().saturating_sub(1)));
+        let visibility = self.visibility();
+        // A path that survived but no longer matches the filter must not
+        // keep the selection (or carried content): it would display a file
+        // the sidebar hides.
+        let repositioned = previous_path
+            .and_then(|path| {
+                self.files
+                    .iter()
+                    .position(|file| file.change.display_path() == &path)
+            })
+            .filter(|&index| visibility.matches(&self.files[index]));
+        let clamped = self.selected.min(self.files.len().saturating_sub(1));
+        self.selected = repositioned
+            .or_else(|| nearest_visible(&self.files, clamped, visibility))
+            .unwrap_or(clamped);
         match (carried, repositioned) {
             // The selected path survived and nothing touched its content:
             // reactivate the held pair under the new generation. Line,
@@ -514,8 +581,9 @@ impl App {
                     file.no_op = true;
                 }
                 if selected {
-                    if let Some(next) = next_visible(&self.files, self.selected, true)
-                        .or_else(|| next_visible(&self.files, self.selected, false))
+                    let visibility = self.visibility();
+                    if let Some(next) = next_visible(&self.files, self.selected, true, visibility)
+                        .or_else(|| next_visible(&self.files, self.selected, false, visibility))
                     {
                         self.selected = next;
                         self.request_selected();
@@ -569,9 +637,12 @@ impl App {
     }
 
     fn prefetch_adjacent(&self) {
-        let Some(file_id) = adjacent_prefetch_candidate(&self.files, self.selected, |candidate| {
-            self.content_cache.contains_key(&candidate)
-        }) else {
+        let Some(file_id) = adjacent_prefetch_candidate(
+            &self.files,
+            self.selected,
+            self.visibility(),
+            |candidate| self.content_cache.contains_key(&candidate),
+        ) else {
             return;
         };
         if let (Some(resolver), Some(file)) = (&self.resolver, self.files.get(file_id)) {
@@ -609,15 +680,36 @@ impl App {
     }
 
     fn next_file(&mut self) {
-        if let Some(next) = next_visible(&self.files, self.selected, true) {
+        if let Some(next) = next_visible(&self.files, self.selected, true, self.visibility()) {
             self.selected = next;
             self.request_selected();
         }
     }
 
     fn previous_file(&mut self) {
-        if let Some(previous) = next_visible(&self.files, self.selected, false) {
+        if let Some(previous) = next_visible(&self.files, self.selected, false, self.visibility()) {
             self.selected = previous;
+            self.request_selected();
+        }
+    }
+
+    fn visibility(&self) -> Visibility {
+        Visibility {
+            status: self.status_filter,
+        }
+    }
+
+    /// Cycle the status filter and, if the selection no longer matches,
+    /// move it to the first match. When nothing matches, the selection
+    /// stays parked so cycling back to a broader filter restores position;
+    /// the empty view is covered by [`Self::no_changes_message`].
+    fn cycle_status_filter(&mut self) {
+        self.status_filter = self.status_filter.next();
+        let Some(target) = nearest_visible(&self.files, self.selected, self.visibility()) else {
+            return;
+        };
+        if target != self.selected {
+            self.selected = target;
             self.request_selected();
         }
     }
@@ -821,6 +913,10 @@ impl App {
                 self.split_preference = !self.split_preference;
                 true
             }
+            KeyCode::Char('f') => {
+                self.cycle_status_filter();
+                true
+            }
             _ => false,
         }
     }
@@ -892,8 +988,10 @@ impl App {
             }
         }
         frame.render_widget(
-            Paragraph::new(" j/k scroll  [/] hunk  n/p file  s split  PgUp/PgDn  q/Ctrl-C quit ")
-                .style(Style::default().fg(self.theme.footer_fg)),
+            Paragraph::new(
+                " j/k scroll  [/] hunk  n/p file  f filter  s split  PgUp/PgDn  q/Ctrl-C quit ",
+            )
+            .style(Style::default().fg(self.theme.footer_fg)),
             chunks[2],
         );
     }
@@ -974,42 +1072,70 @@ impl App {
     fn sidebar_lines(&self, height: usize, width: u16) -> Vec<Line<'static>> {
         // The right border consumes one column inside the sidebar area.
         let line_width = width.saturating_sub(1) as usize;
-        sidebar_file_indices(&self.files, self.selected, height)
+        sidebar_file_indices(&self.files, self.selected, height, self.visibility())
             .into_iter()
-            .map(|index| {
-                let selected = index == self.selected;
-                let prefix = if selected { "> " } else { "  " };
-                let label = file_label(&self.files[index].change);
-                let mut text = format!(
-                    "{prefix}{}",
-                    truncate_display_width(&label, line_width.saturating_sub(prefix.len()))
-                );
-                if selected {
-                    let padding = line_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-                    text.push_str(&" ".repeat(padding));
-                }
-                let style = if selected {
-                    Style::default()
-                        .fg(self.theme.sidebar_selected_fg)
-                        .bg(self.theme.sidebar_selected_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(self.theme.sidebar_fg)
-                };
-                Line::styled(text, style)
-            })
+            .map(|index| self.sidebar_line(index, line_width))
             .collect()
     }
 
-    fn visible_file_count(&self) -> usize {
-        self.files.iter().filter(|file| !file.no_op).count()
+    fn sidebar_line(&self, index: usize, line_width: usize) -> Line<'static> {
+        let selected = index == self.selected;
+        let change = &self.files[index].change;
+        let prefix = if selected { "> " } else { "  " };
+        // The "A " marker is always two ASCII columns; only the path needs
+        // width-aware truncation.
+        let path_budget = line_width.saturating_sub(prefix.len() + 2);
+        let path = truncate_display_width(&file_label_path(change), path_budget);
+        let base = if selected {
+            Style::default()
+                .fg(self.theme.sidebar_selected_fg)
+                .bg(self.theme.sidebar_selected_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.theme.sidebar_fg)
+        };
+        // The selected row keeps its uniform highlight pair; a per-status
+        // color would fight the reversed background.
+        let marker = if selected {
+            base
+        } else {
+            Style::default().fg(self.theme.status_fg(change.status))
+        };
+        let mut spans = vec![
+            Span::styled(prefix, base),
+            Span::styled(format!("{} ", status_char(change.status)), marker),
+            Span::styled(path.clone(), base),
+        ];
+        if selected {
+            let text_width = prefix.len() + 2 + UnicodeWidthStr::width(path.as_str());
+            let padding = line_width.saturating_sub(text_width);
+            if padding > 0 {
+                spans.push(Span::styled(" ".repeat(padding), base));
+            }
+        }
+        Line::from(spans)
     }
 
-    fn no_changes_message(&self) -> &'static str {
-        if self.comparison_label.is_some() {
-            "No changes in this comparison."
-        } else {
-            "Working tree is clean."
+    fn visible_file_count(&self) -> usize {
+        let visibility = self.visibility();
+        self.files
+            .iter()
+            .filter(|file| visibility.matches(file))
+            .count()
+    }
+
+    fn no_changes_message(&self) -> String {
+        // An active filter that hides a real change must not read as a clean
+        // tree — but blaming the filter is only honest while a non-no-op
+        // change exists; candidates that all resolved to no-ops would be
+        // invisible under any filter.
+        let any_real_change = self.files.iter().any(|file| !file.no_op);
+        match self.status_filter.label() {
+            Some(label) if any_real_change => {
+                format!("No files match filter: {label}.")
+            }
+            _ if self.comparison_label.is_some() => "No changes in this comparison.".to_owned(),
+            _ => "Working tree is clean.".to_owned(),
         }
     }
 
@@ -1034,6 +1160,12 @@ impl App {
                 self.config_warnings.len()
             ));
         }
+        // Like the split explanation, the filter explains surprising state —
+        // why the list shrank — so it too must precede every variable-length
+        // field; trailing chips are what a narrow terminal clips first.
+        if let Some(label) = self.status_filter.label() {
+            prefix.push_str(&format!("filter: {label}  "));
+        }
         if let Some(label) = &self.comparison_label {
             prefix.push_str(label);
             prefix.push_str("  ");
@@ -1054,11 +1186,12 @@ impl App {
         let Some(file) = self.files.get(self.selected) else {
             return format!("{prefix}no changes{notices} ");
         };
+        let visibility = self.visibility();
         let ordinal = self
             .files
             .iter()
             .enumerate()
-            .filter(|(_, file)| !file.no_op)
+            .filter(|(_, file)| visibility.matches(file))
             .position(|(id, _)| id == self.selected)
             .map_or(0, |index| index + 1);
         let structural = match self.structural_worker.state() {
@@ -1272,22 +1405,42 @@ fn commit_comparison_label(revision: &[u8], has_parent: bool) -> String {
     }
 }
 
-fn next_visible(files: &[FileModel], selected: usize, forward: bool) -> Option<usize> {
+fn next_visible(
+    files: &[FileModel],
+    selected: usize,
+    forward: bool,
+    visibility: Visibility,
+) -> Option<usize> {
     if forward {
-        ((selected + 1)..files.len()).find(|&index| !files[index].no_op)
+        ((selected + 1)..files.len()).find(|&index| visibility.matches(&files[index]))
     } else {
-        (0..selected).rev().find(|&index| !files[index].no_op)
+        (0..selected)
+            .rev()
+            .find(|&index| visibility.matches(&files[index]))
     }
+}
+
+/// `wanted` itself when it satisfies `visibility`, else the first match in
+/// list order, else `None` when nothing matches.
+fn nearest_visible(files: &[FileModel], wanted: usize, visibility: Visibility) -> Option<usize> {
+    if files
+        .get(wanted)
+        .is_some_and(|file| visibility.matches(file))
+    {
+        return Some(wanted);
+    }
+    files.iter().position(|file| visibility.matches(file))
 }
 
 fn adjacent_prefetch_candidate(
     files: &[FileModel],
     selected: usize,
+    visibility: Visibility,
     is_cached: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     [
-        next_visible(files, selected, true),
-        next_visible(files, selected, false),
+        next_visible(files, selected, true, visibility),
+        next_visible(files, selected, false, visibility),
     ]
     .into_iter()
     .flatten()
@@ -1328,14 +1481,23 @@ fn body_areas(area: Rect, show_sidebar: bool, sidebar_min_width: u16) -> (Option
     (Some(chunks[0]), chunks[1])
 }
 
-fn sidebar_file_indices(files: &[FileModel], selected: usize, height: usize) -> Vec<usize> {
-    if height == 0 || files.get(selected).is_none_or(|file| file.no_op) {
+fn sidebar_file_indices(
+    files: &[FileModel],
+    selected: usize,
+    height: usize,
+    visibility: Visibility,
+) -> Vec<usize> {
+    if height == 0
+        || files
+            .get(selected)
+            .is_none_or(|file| !visibility.matches(file))
+    {
         return Vec::new();
     }
 
     let mut start = selected;
     for _ in 0..height / 2 {
-        let Some(previous) = next_visible(files, start, false) else {
+        let Some(previous) = next_visible(files, start, false, visibility) else {
             break;
         };
         start = previous;
@@ -1347,11 +1509,11 @@ fn sidebar_file_indices(files: &[FileModel], selected: usize, height: usize) -> 
         && indices.len() < height
     {
         indices.push_back(index);
-        cursor = next_visible(files, index, true);
+        cursor = next_visible(files, index, true, visibility);
     }
 
     while indices.len() < height {
-        let Some(previous) = next_visible(files, indices[0], false) else {
+        let Some(previous) = next_visible(files, indices[0], false, visibility) else {
             break;
         };
         indices.push_front(previous);
@@ -1408,13 +1570,18 @@ fn is_quit_key(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn file_label(change: &FileChange) -> String {
-    let status = match change.status {
-        ChangeStatus::Add => "A",
-        ChangeStatus::Delete => "D",
-        ChangeStatus::Modify => "M",
-        ChangeStatus::Rename => "R",
-    };
+fn status_char(status: ChangeStatus) -> char {
+    match status {
+        ChangeStatus::Add => 'A',
+        ChangeStatus::Delete => 'D',
+        ChangeStatus::Modify => 'M',
+        ChangeStatus::Rename => 'R',
+    }
+}
+
+/// The label without its status marker; the sidebar styles the marker
+/// separately, the title keeps the combined [`file_label`].
+fn file_label_path(change: &FileChange) -> String {
     let path = match (&change.old_path, &change.new_path) {
         (Some(old), Some(new)) if old != new => {
             format!("{} → {}", old.display_escaped(), new.display_escaped())
@@ -1422,13 +1589,14 @@ fn file_label(change: &FileChange) -> String {
         _ => change.display_path().display_escaped(),
     };
     if change.old_mode != change.new_mode {
-        format!(
-            "{status} {path} [{:?} → {:?}]",
-            change.old_mode, change.new_mode
-        )
+        format!("{path} [{:?} → {:?}]", change.old_mode, change.new_mode)
     } else {
-        format!("{status} {path}")
+        path
     }
+}
+
+fn file_label(change: &FileChange) -> String {
+    format!("{} {}", status_char(change.status), file_label_path(change))
 }
 
 fn terminal_safe_label(value: &str) -> String {
@@ -1573,6 +1741,49 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
 
+    const ALL: Visibility = Visibility {
+        status: StatusFilter::All,
+    };
+
+    fn change_with_status(path: &[u8], status: ChangeStatus) -> FileChange {
+        let present = ContentSource::Submodule {
+            commit: Oid([1; 20]),
+            dirty: false,
+        };
+        let (old, new, old_path, new_path) = match status {
+            ChangeStatus::Add => (ContentSource::Absent, present, None, Some(path)),
+            ChangeStatus::Delete => (present, ContentSource::Absent, Some(path), None),
+            ChangeStatus::Modify => (present.clone(), present, Some(path), Some(path)),
+            ChangeStatus::Rename => (
+                present.clone(),
+                present,
+                Some(b"renamed-from".as_slice()),
+                Some(path),
+            ),
+        };
+        let old_mode = (old != ContentSource::Absent).then_some(EntryMode::Submodule);
+        let new_mode = (new != ContentSource::Absent).then_some(EntryMode::Submodule);
+        let file = FileChange::classify(
+            old_path.map(GitPath::from_bytes),
+            new_path.map(GitPath::from_bytes),
+            old,
+            new,
+            old_mode,
+            new_mode,
+        )
+        .expect("change");
+        assert_eq!(file.status, status);
+        file
+    }
+
+    fn model(change: FileChange) -> FileModel {
+        FileModel {
+            change,
+            no_op: false,
+            load_error: None,
+        }
+    }
+
     fn change(status_path: &[u8]) -> FileChange {
         FileChange::classify(
             None,
@@ -1606,6 +1817,7 @@ mod tests {
             theme: crate::theme::theme(crate::theme::ThemeChoice::Dark),
             config_warnings: Vec::new(),
             split_preference: false,
+            status_filter: StatusFilter::All,
             snapshot: SnapshotId(1),
             selected: 0,
             scroll: 0,
@@ -1770,9 +1982,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(sidebar_file_indices(&files, 4, 3), vec![3, 4, 5]);
-        assert_eq!(sidebar_file_indices(&files, 6, 3), vec![4, 5, 6]);
-        assert!(sidebar_file_indices(&files, 4, 0).is_empty());
+        assert_eq!(sidebar_file_indices(&files, 4, 3, ALL), vec![3, 4, 5]);
+        assert_eq!(sidebar_file_indices(&files, 6, 3, ALL), vec![4, 5, 6]);
+        assert!(sidebar_file_indices(&files, 4, 0, ALL).is_empty());
     }
 
     #[test]
@@ -1791,11 +2003,18 @@ mod tests {
         let lines = app.sidebar_lines(2, 10);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].spans[0].content.starts_with("> "));
-        assert_eq!(
-            UnicodeWidthStr::width(lines[0].spans[0].content.as_ref()),
-            9
+        let selected_width: usize = lines[0]
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        assert_eq!(selected_width, 9);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::LightCyan))
         );
-        assert_eq!(lines[0].style.bg, Some(Color::LightCyan));
         assert!(lines[1].spans[0].content.starts_with("  "));
     }
 
@@ -1904,10 +2123,10 @@ mod tests {
                 load_error: None,
             },
         ];
-        assert_eq!(next_visible(&files, 0, true), Some(2));
-        assert_eq!(next_visible(&files, 2, true), None);
-        assert_eq!(next_visible(&files, 2, false), Some(0));
-        assert_eq!(next_visible(&files, 0, false), None);
+        assert_eq!(next_visible(&files, 0, true, ALL), Some(2));
+        assert_eq!(next_visible(&files, 2, true, ALL), None);
+        assert_eq!(next_visible(&files, 2, false, ALL), Some(0));
+        assert_eq!(next_visible(&files, 0, false, ALL), None);
     }
 
     #[test]
@@ -1935,16 +2154,163 @@ mod tests {
             },
         ];
 
-        assert_eq!(adjacent_prefetch_candidate(&files, 2, |_| false), Some(3));
         assert_eq!(
-            adjacent_prefetch_candidate(&files, 2, |candidate| candidate == 3),
+            adjacent_prefetch_candidate(&files, 2, ALL, |_| false),
+            Some(3)
+        );
+        assert_eq!(
+            adjacent_prefetch_candidate(&files, 2, ALL, |candidate| candidate == 3),
             Some(0)
         );
         assert_eq!(
-            adjacent_prefetch_candidate(&files, 2, |candidate| {
+            adjacent_prefetch_candidate(&files, 2, ALL, |candidate| {
                 candidate == 0 || candidate == 3
             }),
             None
+        );
+    }
+
+    #[test]
+    fn status_filter_cycles_in_display_order() {
+        let mut filter = StatusFilter::All;
+        let expected = [
+            StatusFilter::Only(ChangeStatus::Add),
+            StatusFilter::Only(ChangeStatus::Modify),
+            StatusFilter::Only(ChangeStatus::Delete),
+            StatusFilter::Only(ChangeStatus::Rename),
+            StatusFilter::All,
+        ];
+        for step in expected {
+            filter = filter.next();
+            assert_eq!(filter, step);
+        }
+    }
+
+    #[test]
+    fn visibility_excludes_no_ops_and_status_mismatches() {
+        let mut no_op = model(change_with_status(b"a", ChangeStatus::Add));
+        no_op.no_op = true;
+        let added = model(change_with_status(b"b", ChangeStatus::Add));
+        let only_add = Visibility {
+            status: StatusFilter::Only(ChangeStatus::Add),
+        };
+        assert!(!only_add.matches(&no_op));
+        assert!(!ALL.matches(&no_op));
+        assert!(only_add.matches(&added));
+        assert!(
+            !Visibility {
+                status: StatusFilter::Only(ChangeStatus::Modify),
+            }
+            .matches(&added)
+        );
+    }
+
+    #[test]
+    fn nearest_visible_prefers_wanted_then_first_match() {
+        let files = vec![
+            model(change_with_status(b"a", ChangeStatus::Modify)),
+            model(change_with_status(b"b", ChangeStatus::Add)),
+            model(change_with_status(b"c", ChangeStatus::Add)),
+        ];
+        let only_add = Visibility {
+            status: StatusFilter::Only(ChangeStatus::Add),
+        };
+        assert_eq!(nearest_visible(&files, 2, only_add), Some(2));
+        assert_eq!(nearest_visible(&files, 0, only_add), Some(1));
+        let only_delete = Visibility {
+            status: StatusFilter::Only(ChangeStatus::Delete),
+        };
+        assert_eq!(nearest_visible(&files, 0, only_delete), None);
+    }
+
+    #[test]
+    fn cycling_the_filter_moves_the_selection_to_the_first_match() {
+        let mut app = test_app();
+        app.files = vec![
+            model(change_with_status(b"a", ChangeStatus::Add)),
+            model(change_with_status(b"b", ChangeStatus::Modify)),
+        ];
+        app.cycle_status_filter();
+        assert_eq!(app.status_filter, StatusFilter::Only(ChangeStatus::Add));
+        assert_eq!(app.selected, 0);
+        app.cycle_status_filter();
+        assert_eq!(app.status_filter, StatusFilter::Only(ChangeStatus::Modify));
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.visible_file_count(), 1);
+        assert!(app.title(120).contains("filter: Modify"));
+        assert!(app.title(120).contains("[1/1]"));
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_parks_the_selection_and_says_so() {
+        let mut app = test_app();
+        app.files = vec![
+            model(change_with_status(b"a", ChangeStatus::Add)),
+            model(change_with_status(b"b", ChangeStatus::Add)),
+        ];
+        app.selected = 1;
+        app.cycle_status_filter();
+        app.cycle_status_filter();
+        assert_eq!(app.status_filter, StatusFilter::Only(ChangeStatus::Modify));
+        assert_eq!(app.selected, 1, "selection stays parked");
+        assert_eq!(app.visible_file_count(), 0);
+        let body = app.body_lines(4);
+        assert_eq!(
+            body[0].spans[0].content.as_ref(),
+            "No files match filter: Modify."
+        );
+        // Cycling back around to All restores the parked selection.
+        app.cycle_status_filter();
+        app.cycle_status_filter();
+        app.cycle_status_filter();
+        assert_eq!(app.status_filter, StatusFilter::All);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn sidebar_colors_the_status_marker_except_on_the_selected_row() {
+        let mut app = test_app();
+        app.files = vec![
+            model(change_with_status(b"a", ChangeStatus::Add)),
+            model(change_with_status(b"b", ChangeStatus::Modify)),
+        ];
+        let lines = app.sidebar_lines(2, 20);
+        // Selected row: uniform highlight pair, no status color.
+        assert_eq!(lines[0].spans[1].content.as_ref(), "A ");
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(app.theme.sidebar_selected_fg)
+        );
+        // Unselected row: the marker carries the status color, the path the
+        // plain sidebar color.
+        assert_eq!(lines[1].spans[1].content.as_ref(), "M ");
+        assert_eq!(
+            lines[1].spans[1].style.fg,
+            Some(app.theme.status_fg(ChangeStatus::Modify))
+        );
+        assert_eq!(lines[1].spans[2].style.fg, Some(app.theme.sidebar_fg));
+    }
+
+    #[test]
+    fn snapshot_carry_is_dropped_when_the_filter_hides_the_repositioned_file() {
+        let mut app = test_app();
+        app.files = vec![
+            model(change_with_status(b"a", ChangeStatus::Modify)),
+            model(change_with_status(b"b", ChangeStatus::Add)),
+        ];
+        app.selected = 1;
+        app.status_filter = StatusFilter::Only(ChangeStatus::Add);
+        // The selected path "b" survives the re-discover but is now a
+        // modification, which the active filter hides.
+        let changes = vec![
+            change_with_status(b"b", ChangeStatus::Modify),
+            change_with_status(b"c", ChangeStatus::Add),
+        ];
+        app.apply_snapshot_with_carry(changes, Some(prepared(PreparedKind::Text)));
+        assert_eq!(app.selected, 1, "moved to the remaining Add file");
+        assert!(
+            app.current_content.is_none(),
+            "carried content must not survive onto a different file"
         );
     }
 
@@ -2101,6 +2467,33 @@ mod tests {
         assert_eq!(
             app.body_lines(10)[0].spans[0].content,
             "Working tree is clean."
+        );
+    }
+
+    #[test]
+    fn a_filter_over_only_no_ops_still_reports_a_clean_tree() {
+        let mut app = test_app();
+        app.files.iter_mut().for_each(|file| file.no_op = true);
+        app.status_filter = StatusFilter::Only(ChangeStatus::Modify);
+        // Nothing would be visible under any filter, so blaming the filter
+        // would be misleading.
+        assert_eq!(
+            app.body_lines(10)[0].spans[0].content,
+            "Working tree is clean."
+        );
+    }
+
+    #[test]
+    fn the_filter_chip_precedes_the_variable_length_title_fields() {
+        let mut app = test_app();
+        app.comparison_label = Some("comparing main..topic".to_owned());
+        app.status_filter = StatusFilter::Only(ChangeStatus::Add);
+        let title = app.title(120);
+        let filter_at = title.find("filter: Add").expect("filter chip");
+        let label_at = title.find("comparing").expect("comparison label");
+        assert!(
+            filter_at < label_at,
+            "narrow terminals clip the tail; the filter must lead: {title:?}"
         );
     }
 
