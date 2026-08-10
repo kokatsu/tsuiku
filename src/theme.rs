@@ -22,13 +22,22 @@ pub enum ThemeChoice {
 pub struct Theme {
     pub removed_bg: Color,
     pub added_bg: Color,
-    /// Background of structurally emphasized runs.
-    pub structural_bg: Color,
+    /// Background of structurally emphasized runs on removed rows: a more
+    /// pronounced shade of the row background so the emphasis stays in the
+    /// same hue family instead of clashing with it.
+    pub structural_removed_bg: Color,
+    /// Background of structurally emphasized runs on added rows.
+    pub structural_added_bg: Color,
+    /// Background of structurally emphasized runs on context rows, where
+    /// there is no row tint to harmonize with.
+    pub structural_context_bg: Color,
     keyword_fg: Color,
     string_fg: Color,
     comment_fg: Color,
     delimiter_fg: Color,
     type_fg: Color,
+    /// Foreground for emphasized runs without a token-kind color; must stay
+    /// readable on all three structural backgrounds of its theme.
     other_fg: Color,
     pub sidebar_fg: Color,
     pub sidebar_selected_fg: Color,
@@ -52,17 +61,18 @@ impl Theme {
     }
 }
 
-/// The palette used since the first release; unchanged as the dark theme.
 static DARK: Theme = Theme {
     removed_bg: Color::Rgb(60, 20, 25),
     added_bg: Color::Rgb(15, 55, 35),
-    structural_bg: Color::Rgb(85, 65, 15),
+    structural_removed_bg: Color::Rgb(110, 40, 45),
+    structural_added_bg: Color::Rgb(30, 100, 60),
+    structural_context_bg: Color::Rgb(85, 65, 15),
     keyword_fg: Color::LightMagenta,
     string_fg: Color::LightYellow,
     comment_fg: Color::Gray,
     delimiter_fg: Color::LightCyan,
     type_fg: Color::LightBlue,
-    other_fg: Color::White,
+    other_fg: Color::Rgb(255, 255, 158),
     sidebar_fg: Color::DarkGray,
     sidebar_selected_fg: Color::Black,
     sidebar_selected_bg: Color::LightCyan,
@@ -73,7 +83,9 @@ static DARK: Theme = Theme {
 static LIGHT: Theme = Theme {
     removed_bg: Color::Rgb(255, 220, 223),
     added_bg: Color::Rgb(214, 245, 214),
-    structural_bg: Color::Rgb(250, 236, 160),
+    structural_removed_bg: Color::Rgb(255, 175, 178),
+    structural_added_bg: Color::Rgb(160, 235, 175),
+    structural_context_bg: Color::Rgb(250, 236, 160),
     keyword_fg: Color::Rgb(150, 0, 150),
     string_fg: Color::Rgb(130, 90, 0),
     comment_fg: Color::Rgb(100, 100, 100),
